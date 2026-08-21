@@ -10,6 +10,10 @@ from typing import Any
 
 import numpy as np
 
+from .performance_targets import (
+    PERFORMANCE_TARGETS_RELATIVE_PATH,
+    load_controller_performance_targets,
+)
 from .physics_motor_model import load_physics_motor_config
 
 
@@ -31,6 +35,13 @@ PARAMETER_ORDER = (
 PHYSICS_PARAMETER_SPACE_JSON = "controller_parameter_space.json"
 PHYSICS_PARAMETER_SPACE_NPZ = "controller_parameter_space.npz"
 _BOUNDARY_EPS_FACTOR = 128.0
+_FEASIBILITY_BOUND_MARGIN_FRACTION = 0.05
+_CURRENT_EVIDENCE_SELECTION_GROUPS = (
+    "nominal",
+    "corners_8",
+    "dense_grid_125",
+    "training_40",
+)
 
 
 def _physical_boundary_tolerance(lower: float, upper: float) -> float:
@@ -197,6 +208,142 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _sample_period_for_module(config: Any, module: str) -> float | None:
+    """Return the implementation period belonging to one controller module."""
+
+    if module == "DOBC":
+        module = "speed"
+    if module not in {"current", "speed", "position"}:
+        return None
+    return float(config.sample_period_s_for(module))
+
+
+def _relative_or_absolute(path: Path, root: Path) -> str:
+    try:
+        value = path.resolve().relative_to(root.resolve())
+    except ValueError:
+        value = path.resolve()
+    return str(value).replace("\\", "/")
+
+
+def load_current_pidf_feasibility_evidence(
+    project_root: Path,
+    report_path: Path,
+) -> dict[str, Any]:
+    """Validate one non-training 40 kHz scan before it can inform bounds.
+
+    Validation diagnostics may be present in the report, but the selected
+    candidate must have been ranked using only nominal, uncertainty-grid and
+    training-model groups.  This function deliberately does not inspect the
+    validation group's pass/fail result.
+    """
+
+    root = Path(project_root).resolve()
+    path = Path(report_path).resolve()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("run_kind") != "non_training_multirate_current_pidf_feasibility_scan":
+        raise ValueError("current PIDF evidence is not a non-training scan report")
+    if payload.get("formal_configuration_modified") is not False:
+        raise ValueError("current PIDF evidence modified the formal configuration")
+    if payload.get("formal_parameter_space_modified") is not False:
+        raise ValueError("current PIDF evidence modified the formal parameter space")
+    if payload.get("sac_training_executed") is not False:
+        raise ValueError("current PIDF evidence must not execute SAC training")
+
+    config = load_physics_motor_config(root)
+    required_rate_hz = 1.0 / config.sample_period_s_for("current")
+    matching = [
+        row
+        for row in payload.get("sample_rates", [])
+        if np.isclose(
+            float(row.get("sample_rate_hz", np.nan)),
+            required_rate_hz,
+            rtol=1e-12,
+            atol=1e-9,
+        )
+    ]
+    if len(matching) != 1:
+        raise ValueError(
+            "current PIDF evidence must contain exactly one result matching "
+            f"the configured {required_rate_hz:g} Hz current loop"
+        )
+    row = matching[0]
+    search = row.get("search", {})
+    selection_groups = tuple(str(name) for name in search.get("candidate_selection_groups", []))
+    if search.get("validation_used_for_candidate_selection") is not False:
+        raise ValueError("validation models must not participate in PIDF selection")
+    if selection_groups != _CURRENT_EVIDENCE_SELECTION_GROUPS:
+        raise ValueError(
+            "candidate selection groups must be nominal, corners_8, "
+            "dense_grid_125 and training_40, in that order"
+        )
+
+    selected = row.get("selected", {})
+    groups = selected.get("groups", {})
+    if any(name not in groups for name in selection_groups):
+        raise ValueError("current PIDF evidence is missing a selection audit group")
+    if not all(bool(groups[name].get("all_six_pass")) for name in selection_groups):
+        raise ValueError("current PIDF evidence candidate failed a selection audit group")
+    current_parameters = selected.get("current_parameters", {})
+    candidate = {
+        name: float(current_parameters[name]) for name in ("kpcurr", "kicurr", "kdcurr")
+    }
+    if not np.isfinite(np.asarray(list(candidate.values()), dtype=np.float64)).all():
+        raise ValueError("current PIDF evidence contains non-finite parameters")
+    if any(value <= 0.0 for value in candidate.values()):
+        raise ValueError("current PIDF evidence parameters must be positive")
+
+    continuous_path = path.with_name("continuous_worst_case_report.json")
+    continuous = json.loads(continuous_path.read_text(encoding="utf-8"))
+    if continuous.get("run_kind") != "non_training_continuous_current_uncertainty_refinement":
+        raise ValueError("current PIDF evidence lacks the continuous-box refinement")
+    if continuous.get("formal_configuration_modified") is not False:
+        raise ValueError("continuous refinement modified the formal configuration")
+    if continuous.get("formal_parameter_space_modified") is not False:
+        raise ValueError("continuous refinement modified the formal parameter space")
+    if continuous.get("sac_training_executed") is not False:
+        raise ValueError("continuous refinement must not execute SAC training")
+    refinements = [
+        item
+        for item in continuous.get("refinements", [])
+        if np.isclose(
+            float(item.get("sample_rate_hz", np.nan)),
+            required_rate_hz,
+            rtol=1e-12,
+            atol=1e-9,
+        )
+    ]
+    if len(refinements) != 1:
+        raise ValueError("continuous refinement must contain the configured current rate")
+    refinement = refinements[0]
+    refined_candidate = refinement.get("current_parameters", {})
+    if any(
+        not np.isclose(
+            float(refined_candidate.get(name, np.nan)),
+            value,
+            rtol=1e-12,
+            atol=1e-15,
+        )
+        for name, value in candidate.items()
+    ):
+        raise ValueError("continuous refinement candidate does not match the scan")
+    if refinement.get("continuous_box_all_six_pass") is not True:
+        raise ValueError("current PIDF candidate failed continuous-box refinement")
+    return {
+        "report_path": _relative_or_absolute(path, root),
+        "report_sha256": _sha256(path),
+        "continuous_report_path": _relative_or_absolute(continuous_path, root),
+        "continuous_report_sha256": _sha256(continuous_path),
+        "sample_rate_hz": required_rate_hz,
+        "sample_period_s": config.sample_period_s_for("current"),
+        "candidate_selection_groups": list(selection_groups),
+        "validation_used_for_candidate_selection": False,
+        "selected_current_parameters": candidate,
+        "bound_margin_fraction": _FEASIBILITY_BOUND_MARGIN_FRACTION,
+        "role": "bounds_only_not_acceptance_or_hardware_evidence",
+    }
+
+
 def _digital_value(name: str, analog_value: float, sample_period_s: float) -> float:
     if name.startswith("kp"):
         return analog_value
@@ -256,15 +403,15 @@ def _space_from_payload(payload: dict[str, Any]) -> ControllerParameterSpace:
 
 
 
-def derive_physics_controller_initials(project_root: Path) -> np.ndarray:
-    """Derive the 11 physics initials from the mentor model and bandwidths."""
-
+def _controller_seed_from_bandwidths(
+    project_root: Path, bandwidths_hz: dict[str, float]
+) -> np.ndarray:
     config = load_physics_motor_config(project_root)
     motor = config.nominal
     design = config.payload["controller_design"]
-    current_omega = 2.0 * np.pi * float(design["current_crossover_hz"])
-    speed_omega = 2.0 * np.pi * float(design["speed_crossover_hz"])
-    position_omega = 2.0 * np.pi * float(design["position_crossover_hz"])
+    current_omega = 2.0 * np.pi * float(bandwidths_hz["current"])
+    speed_omega = 2.0 * np.pi * float(bandwidths_hz["speed"])
+    position_omega = 2.0 * np.pi * float(bandwidths_hz["position"])
     derivative_ratio = float(design["derivative_ratio_at_crossover"])
     position_integral_ratio = float(
         design["position_integral_ratio_at_crossover"]
@@ -318,14 +465,78 @@ def derive_physics_controller_initials(project_root: Path) -> np.ndarray:
     )
 
 
-def build_physics_controller_parameter_space(project_root: Path) -> dict[str, Any]:
+def _initialization_bandwidths_hz(project_root: Path) -> dict[str, float]:
+    """Return conservative loop-shaping frequencies for a valid reset seed.
+
+    These are numerical initialization heuristics only.  They are deliberately
+    kept separate from the real closed-loop performance targets used by the
+    evaluator and Reward.
+    """
+
+    config = load_physics_motor_config(project_root)
+    targets = load_controller_performance_targets(project_root)
+    current = min(
+        targets.loop("current").bandwidth_hz,
+        0.08 / config.sample_period_s_for("current"),
+        0.08 / config.nominal.current_delay_s,
+    )
+    speed = min(
+        targets.loop("speed").bandwidth_hz,
+        0.008 / config.sample_period_s_for("speed"),
+        current / 10.0,
+    )
+    position = min(
+        targets.loop("position").bandwidth_hz,
+        0.002 / config.sample_period_s_for("position"),
+        speed / 4.0,
+    )
+    return {"current": current, "speed": speed, "position": position}
+
+
+def derive_physics_controller_initials(project_root: Path) -> np.ndarray:
+    """Derive a conservative, numerically valid initial search seed."""
+
+    return _controller_seed_from_bandwidths(
+        project_root, _initialization_bandwidths_hz(project_root)
+    )
+
+
+def build_physics_controller_parameter_space(
+    project_root: Path,
+    *,
+    current_feasibility_report: Path | None = None,
+) -> dict[str, Any]:
     """Build a separate 11-D space for the physics training backend."""
 
     root = Path(project_root).resolve()
     config = load_physics_motor_config(root)
+    targets = load_controller_performance_targets(root)
     initial = derive_physics_controller_initials(root)
     by_name = dict(zip(PARAMETER_ORDER, initial.tolist()))
-    dt = config.sample_period_s
+    target_seed = _controller_seed_from_bandwidths(
+        root,
+        {
+            loop: targets.loop(loop).bandwidth_hz
+            for loop in ("current", "speed", "position")
+        },
+    )
+    target_seed_by_name = dict(zip(PARAMETER_ORDER, target_seed.tolist()))
+    sample_periods_s = {
+        loop: config.sample_period_s_for(loop)
+        for loop in ("current", "speed", "position")
+    }
+    feasibility_evidence = (
+        None
+        if current_feasibility_report is None
+        else load_current_pidf_feasibility_evidence(
+            root, Path(current_feasibility_report)
+        )
+    )
+    evidence_parameters = (
+        {}
+        if feasibility_evidence is None
+        else feasibility_evidence["selected_current_parameters"]
+    )
     design = config.payload["controller_design"]
     dobc = design["dobc"]
 
@@ -336,33 +547,61 @@ def build_physics_controller_parameter_space(project_root: Path) -> dict[str, An
         stage: int,
         derivative: bool = False,
     ) -> dict[str, Any]:
-        value = by_name[name]
+        seed_value = by_name[name]
+        target_value = target_seed_by_name[name]
         if derivative:
-            lower, upper, transform = 0.0, value * 4.0, "linear"
+            lower, upper, transform = (
+                0.0,
+                max(seed_value, target_value) * 4.0,
+                "linear",
+            )
             step = 0.05
         else:
-            lower, upper, transform = value / 4.0, value * 4.0, "log"
+            lower, upper, transform = (
+                seed_value / 4.0,
+                max(seed_value, target_value) * 4.0,
+                "log",
+            )
             step = 0.06
+        evidence_value = evidence_parameters.get(name)
+        initial_value = (
+            seed_value if evidence_value is None else float(evidence_value)
+        )
+        if evidence_value is not None:
+            margin = 1.0 + _FEASIBILITY_BOUND_MARGIN_FRACTION
+            if not derivative:
+                lower = min(lower, float(evidence_value) / margin)
+            upper = max(upper, float(evidence_value) * margin)
         return _parameter(
             name=name,
             module=module,
-            initial=value,
+            initial=initial_value,
             lower=lower,
             upper=upper,
             transform=transform,
             action_step_fraction=step,
-            source_kind="mentor_physics_model_derived",
+            source_kind=(
+                "performance_target_seed_derived"
+                if evidence_value is None
+                else "non_training_feasibility_candidate_derived"
+            ),
             source=(
-                "physics loop-shaping with the mentor motor model and fixed "
-                "filtered-derivative semantics"
+                "numerical loop-shaping seed from the motor model and the real "
+                "closed-loop bandwidth table; not an acceptance measurement"
+                + (
+                    "; current-loop bounds minimally cover the validated "
+                    "non-training feasibility candidate with 5 percent margin"
+                    if evidence_value is not None
+                    else ""
+                )
             ),
             original_value=None,
             unit=("native_analog_gain_s" if derivative else (
                 "native_analog_gain_per_s" if name.startswith("ki") else "native_analog_gain"
             )),
-            sample_period_s=dt,
+            sample_period_s=_sample_period_for_module(config, module),
             training_stage=stage,
-            hardware_status="simulation_only_requires_measured_frf_and_hardware_validation",
+            hardware_status="simulation_only_requires_hil_and_hardware_validation",
         )
 
     parameters = [
@@ -384,9 +623,9 @@ def build_physics_controller_parameter_space(project_root: Path) -> dict[str, An
             source=str(dobc["structure"]),
             original_value=None,
             unit="dimensionless",
-            sample_period_s=dt,
-            training_stage=4,
-            hardware_status="simulation_only_requires_disturbance_validation",
+            sample_period_s=_sample_period_for_module(config, "DOBC"),
+            training_stage=2,
+            hardware_status="simulation_only_speed_loop_parameter",
         ),
         _parameter(
             name="tauspeed",
@@ -400,9 +639,9 @@ def build_physics_controller_parameter_space(project_root: Path) -> dict[str, An
             source=str(dobc["structure"]),
             original_value=None,
             unit="s",
-            sample_period_s=dt,
-            training_stage=4,
-            hardware_status="simulation_only_requires_disturbance_validation",
+            sample_period_s=_sample_period_for_module(config, "DOBC"),
+            training_stage=2,
+            hardware_status="simulation_only_speed_loop_parameter",
         ),
         gain_parameter("kpcurr", "current", stage=1),
         gain_parameter("kicurr", "current", stage=1),
@@ -410,19 +649,19 @@ def build_physics_controller_parameter_space(project_root: Path) -> dict[str, An
     ]
 
     payload: dict[str, Any] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "profile": "physics",
         "task_id": PHYSICS_TASK_ID,
         "parameter_order": list(PARAMETER_ORDER),
         "controller_convention": (
             "continuous filtered PIDF: C(s)=Kp+Ki/s+Kd*s/(Tf*s+1); "
-            "implemented discretely at Ts=200 us with anti-windup"
+            "implemented discretely with per-loop sample periods and anti-windup"
         ),
         "digital_conversion": {
             "Kp_d": "Kp",
             "Ki_d": "Ki*Ts",
             "Kd_d": "Kd/Ts",
-            "sample_period_s": dt,
+            "sample_periods_s": sample_periods_s,
             "implementation_note": "runtime uses physical continuous gains, not these display conversions",
         },
         "physics_model": {
@@ -433,7 +672,6 @@ def build_physics_controller_parameter_space(project_root: Path) -> dict[str, An
             "measured_frf_used_as_training_plant": False,
         },
         "controller_design": {
-            "target_crossover_hz": config.target_crossovers_hz,
             "derivative_filter_s": config.derivative_filter_s,
             "derivative_ratio_at_crossover": float(
                 design["derivative_ratio_at_crossover"]
@@ -442,15 +680,29 @@ def build_physics_controller_parameter_space(project_root: Path) -> dict[str, An
                 design["position_integral_ratio_at_crossover"]
             ),
         },
-        "position_design": {
-            "status": "physics_model_derived",
-            "target_crossover_hz": float(design["position_crossover_hz"]),
-            "cascade_ratio_speed_to_position": float(
-                design["speed_crossover_hz"] / design["position_crossover_hz"]
+        "performance_targets": {
+            "config_relative_path": str(PERFORMANCE_TARGETS_RELATIVE_PATH).replace(
+                "\\", "/"
             ),
-            "position_sample_period_s": dt,
-            "continuous_rotation": True,
+            "config_sha256": _sha256(root / PERFORMANCE_TARGETS_RELATIVE_PATH),
+            "closed_loop_bandwidth_hz": {
+                loop: targets.loop(loop).bandwidth_hz
+                for loop in ("current", "speed", "position")
+            },
+            "use": "initial_search_seed_and_direct_six_metric_evaluation",
+            "bandwidth_is_not_relabelled_as_open_loop_crossover": True,
         },
+        "initialization_heuristic": {
+            "loop_shaping_bandwidth_hz": _initialization_bandwidths_hz(root),
+            "sample_period_fraction_for_current": 0.08,
+            "physical_delay_fraction_for_current": 0.08,
+            "sample_period_fraction_for_speed": 0.008,
+            "sample_period_fraction_for_position": 0.002,
+            "current_to_speed_seed_ratio": 10.0,
+            "speed_to_position_seed_ratio": 4.0,
+            "evaluation_role": "none",
+        },
+        "current_pidf_feasibility_evidence": feasibility_evidence,
         "dobc_design": {
             "status": "approved_simulation_structure",
             "structure": str(dobc["structure"]),
@@ -465,7 +717,6 @@ def build_physics_controller_parameter_space(project_root: Path) -> dict[str, An
             "required_before_hardware": [
                 "confirm voltage/current/speed limits against drive and motor ratings",
                 "confirm encoder resolution and feedback filtering",
-                "compare physics FRFs with all measured three-loop FRFs",
                 "validate candidates in HIL and bounded low-energy tests",
             ],
         },
@@ -480,7 +731,7 @@ def build_physics_controller_parameter_space(project_root: Path) -> dict[str, An
     )
     np.savez_compressed(
         output_dir / PHYSICS_PARAMETER_SPACE_NPZ,
-        schema_version=np.asarray(2, dtype=np.int16),
+        schema_version=np.asarray(3, dtype=np.int16),
         profile=np.asarray("physics"),
         task_id=np.asarray(PHYSICS_TASK_ID),
         parameter_names=np.asarray(space.names),
@@ -509,6 +760,10 @@ def load_physics_controller_parameter_space(
     payload = json.loads(path.read_text(encoding="utf-8"))
     if payload.get("profile") != "physics":
         raise ValueError("controller parameter file is not the physics profile")
+    if int(payload.get("schema_version", 0)) != 3:
+        raise ValueError(
+            "controller parameter space is obsolete; rebuild schema version 3"
+        )
     space = _space_from_payload(payload)
     space.validate()
     return space

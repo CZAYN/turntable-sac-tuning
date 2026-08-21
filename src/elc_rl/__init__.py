@@ -5,6 +5,7 @@ __all__ = [
     "data_processing",
     "evaluation_utils",
     "final_test_evaluator",
+    "performance_targets",
     "physics_evaluator",
     "physics_motor_model",
     "physics_test_dataset",

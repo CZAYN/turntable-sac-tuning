@@ -6,7 +6,10 @@ import shutil
 import numpy as np
 import pytest
 
-from elc_rl.controller_parameters import load_physics_controller_parameter_space
+from elc_rl.controller_parameters import (
+    derive_physics_controller_initials,
+    load_physics_controller_parameter_space,
+)
 from elc_rl.physics_motor_model import (
     MODEL_PARAMETER_NAMES,
     PhysicsMotorConfig,
@@ -28,9 +31,104 @@ def test_mentor_model_values_and_units_are_preserved():
     assert motor.resistance_ohm == 4.993
     assert motor.inertia_kg_m2 == 0.00221
     assert motor.torque_constant_nm_per_a == 0.1633
-    assert config.sample_period_s == 200e-6
+    assert config.sample_periods_s == {
+        "current": 25e-6,
+        "speed": 200e-6,
+        "position": 200e-6,
+    }
+    assert config.sample_period_s == 25e-6
+    assert config.base_sample_period_s == 25e-6
+    assert config.controller_update_ratios == {
+        "current": 1,
+        "speed": 8,
+        "position": 8,
+    }
+    assert motor.current_delay_s == 200e-6
+    assert motor.speed_measurement_delay_s == 200e-6
+    assert motor.position_measurement_delay_s == 200e-6
+    assert config.derivative_filter_s["current"] == 200e-6
     assert np.isclose(motor.electrical_time_constant_s, 0.002707 / 4.993)
     assert np.isclose(motor.mechanical_time_constant_s, 0.00221 / 0.0237)
+
+
+def test_single_rate_schema_is_rejected_with_migration_message():
+    base = load_physics_motor_config(PROJECT_ROOT)
+    payload = json.loads(json.dumps(base.payload))
+    payload["schema_version"] = 2
+    payload["sample_period_s"] = 200e-6
+    payload.pop("sample_periods_s")
+    stale = replace(base, payload=payload)
+
+    with pytest.raises(ValueError, match="single-rate.*schema 3"):
+        stale.validate()
+
+
+def test_single_rate_ensemble_state_is_rejected_before_use(tmp_path):
+    processed = tmp_path / "data" / "processed"
+    processed.mkdir(parents=True)
+    np.savez_compressed(
+        processed / "physics_motor_ensemble.npz",
+        schema_version=np.asarray(2, dtype=np.int16),
+    )
+
+    with pytest.raises(ValueError, match="stale.*schema 3"):
+        load_physics_motor_ensemble(tmp_path)
+
+
+def test_outer_periods_must_be_integer_base_step_multiples():
+    base = load_physics_motor_config(PROJECT_ROOT)
+    payload = json.loads(json.dumps(base.payload))
+    payload["sample_periods_s"]["position"] = 190e-6
+    invalid = replace(base, payload=payload)
+
+    with pytest.raises(ValueError, match="integer multiple"):
+        invalid.validate()
+
+
+def test_multirate_kernel_holds_outer_command_for_eight_current_steps():
+    base = load_physics_motor_config(PROJECT_ROOT)
+    payload = json.loads(json.dumps(base.payload))
+    payload["scenarios"]["speed_duration_s"] = 0.001
+    payload["scenarios"]["position_duration_s"] = 0.001
+    config = replace(base, payload=payload)
+    config.validate()
+    parameters = np.asarray(
+        [
+            1.0,
+            0.0,
+            0.0,
+            0.05,
+            0.1,
+            0.0,
+            0.0,
+            0.002,
+            0.1,
+            1.0,
+            0.0,
+        ],
+        dtype=np.float64,
+    )
+
+    trace = simulate_scenario(config, config.nominal, parameters, "speed")
+
+    ratio = config.controller_update_ratios["speed"]
+    assert ratio == 8
+    for start in range(0, trace.current_reference_a.size, ratio):
+        held = trace.current_reference_a[start : start + ratio]
+        assert np.all(held == held[0])
+    assert np.any(np.diff(trace.current_reference_a[::ratio]) != 0.0)
+    assert np.any(np.diff(trace.voltage_v[:ratio]) != 0.0)
+
+    position_trace = simulate_scenario(
+        config, config.nominal, parameters, "position"
+    )
+    for start in range(0, position_trace.speed_reference_rad_s.size, ratio):
+        held_speed = position_trace.speed_reference_rad_s[start : start + ratio]
+        held_current = position_trace.current_reference_a[start : start + ratio]
+        assert np.all(held_speed == held_speed[0])
+        assert np.all(held_current == held_current[0])
+    assert position_trace.speed_reference_rad_s[0] > 0.0
+    assert position_trace.current_reference_a[0] > 0.0
 
 
 def test_provisional_lugre_configuration_is_explicit_and_bounded():
@@ -41,7 +139,7 @@ def test_provisional_lugre_configuration_is_explicit_and_bounded():
         "coulomb_friction_nm",
         "static_friction_nm",
     )
-    assert config.payload["schema_version"] == 2
+    assert config.payload["schema_version"] == 3
     assert config.active_friction_model == "lugre"
     assert config.friction_model["stribeck_exponent"] == 2.0
     assert config.friction_model["initial_bristle_state_rad"] == 0.0
@@ -188,7 +286,15 @@ def test_physics_ensemble_is_coherent_and_inside_declared_uncertainty(tmp_path):
     config = load_physics_motor_config(tmp_path)
     ensemble = load_physics_motor_ensemble(tmp_path)
     assert ensemble["parameters"].shape == (56, len(MODEL_PARAMETER_NAMES))
-    assert int(ensemble["schema_version"]) == 2
+    assert int(ensemble["schema_version"]) == 3
+    assert ensemble["sample_period_names"].tolist() == [
+        "current",
+        "speed",
+        "position",
+    ]
+    assert np.array_equal(
+        ensemble["sample_periods_s"], np.asarray([25e-6, 200e-6, 200e-6])
+    )
     assert np.count_nonzero(ensemble["role"] == "train") == 40
     assert np.count_nonzero(ensemble["role"] == "validation") == 16
     nominal_index = int(np.flatnonzero(ensemble["is_nominal"] == 1)[0])
@@ -208,24 +314,23 @@ def test_physics_ensemble_is_coherent_and_inside_declared_uncertainty(tmp_path):
 
 def test_all_11_physics_initials_are_active_and_match_design():
     space = load_physics_controller_parameter_space(PROJECT_ROOT)
-    expected = np.asarray(
-        [
-            62.13670362077854,
-            780.8328464532967,
-            0.04944681764341488,
-            3.4056021000320973,
-            36.52161528088719,
-            0.0006775230105303097,
-            1.0,
-            0.002,
-            7.614564064852501,
-            14044.89042327615,
-            0.0001514869388013989,
-        ]
-    )
+    expected = derive_physics_controller_initials(PROJECT_ROOT)
+    evidence = space.metadata.get("current_pidf_feasibility_evidence")
+    if evidence is not None:
+        for name, value in evidence["selected_current_parameters"].items():
+            expected[space.names.index(name)] = value
     assert np.allclose(space.initial, expected, rtol=1e-12, atol=0.0)
     assert np.all(space.initial > 0.0)
-    assert all(spec.sample_period_s == 200e-6 for spec in space.specs)
+    expected_period_s = {
+        "current": 25e-6,
+        "speed": 200e-6,
+        "position": 200e-6,
+        "DOBC": 200e-6,
+    }
+    assert all(
+        spec.sample_period_s == expected_period_s[spec.module]
+        for spec in space.specs
+    )
     assert space.metadata["physics_model"]["primary_training_plant"]
 
 
@@ -252,7 +357,9 @@ def test_approved_dobc_sign_reduces_resisting_load_disturbance():
     with_dobc = simulate_scenario(
         config, config.nominal, space.initial, "disturbance"
     )
-    start = int(config.scenarios["disturbance_start_s"] / config.sample_period_s)
+    start = int(
+        config.scenarios["disturbance_start_s"] / config.base_sample_period_s
+    )
     target = config.scenarios["speed_reference_rad_s"]
     peak_without = np.max(np.abs(target - without_dobc.output[start:]))
     peak_with = np.max(np.abs(target - with_dobc.output[start:]))

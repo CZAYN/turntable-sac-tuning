@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "description": "User-supplied controller performance targets. Bandwidth is closed-loop -3 dB bandwidth in Hz; margins are lower bounds; time-domain values are upper bounds.",
+  "definitions": {
+    "bandwidth": "first closed-loop magnitude crossing at -3.0103 dB relative to the low-frequency closed-loop gain",
+    "gain_margin": "minimum classical open-loop gain margin in dB; no phase crossing is treated as infinite and reported with a finite cap",
+    "phase_margin": "minimum classical open-loop phase margin in degrees",
+    "overshoot": "maximum normalized step-response excursion above the final reference",
+    "rise_time": "first 10-to-90 percent step-response rise time",
+    "settling_time": "first time after which the response remains within plus or minus 2 percent of the final reference"
+  },
+  "loops": {
+    "current": {
+      "bandwidth_hz": 1500.0,
+      "minimum_gain_margin_db": 5.0,
+      "minimum_phase_margin_deg": 65.0,
+      "maximum_overshoot_ratio": 0.2,
+      "maximum_rise_time_s": 0.05,
+      "maximum_settling_time_s": 0.1
+    },
+    "speed": {
+      "bandwidth_hz": 100.0,
+      "minimum_gain_margin_db": 5.0,
+      "minimum_phase_margin_deg": 65.0,
+      "maximum_overshoot_ratio": 0.5,
+      "maximum_rise_time_s": 0.5,
+      "maximum_settling_time_s": 1.0
+    },
+    "position": {
+      "bandwidth_hz": 20.0,
+      "minimum_gain_margin_db": 2.0,
+      "minimum_phase_margin_deg": 70.0,
+      "maximum_overshoot_ratio": 0.2,
+      "maximum_rise_time_s": 0.5,
+      "maximum_settling_time_s": 1.0
+    }
+  },
+  "cost": {
+    "bandwidth_relative_scale": 0.1,
+    "huber_delta": 1.0,
+    "frequency_weight": 0.5,
+    "time_weight": 0.5,
+    "model_mean_weight": 0.5,
+    "model_worst_weight": 0.5,
+    "joint_worst_loop_weight": 0.5,
+    "invalid_normalized_error": 10.0
+  }
+}

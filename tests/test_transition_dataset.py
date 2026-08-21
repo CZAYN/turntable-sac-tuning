@@ -39,5 +39,11 @@ def test_small_transition_archive_is_aligned_and_reproducible(tmp_path):
         assert int(data["schema_version"]) == TRANSITION_SCHEMA_VERSION
         assert "observation__frf_context" not in data.files
         assert data["observation__friction_context"].shape == (2, 6)
-        assert data["observation__time_metrics"].shape[0] == 2
+        assert data["observation__performance_metrics"].shape == (2, 18)
+        assert data["performance_metric_names"].shape == (18,)
+        assert "observation__metrics" not in data.files
+        assert "observation__time_metrics" not in data.files
+        assert "frequency_stage_cost" in data.files
+        assert "time_stage_cost" in data.files
+        assert "total_stage_cost" in data.files
         assert np.all(data["action"][:, 3:8] == 0.0)

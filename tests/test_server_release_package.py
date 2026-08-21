@@ -33,8 +33,9 @@ def test_final_test_package_is_reproducible_and_excludes_training_runtime(tmp_pa
         )
     assert "scripts/lock_final_candidate.py" in names
     assert "scripts/run_final_test.py" in names
-    assert "data/processed/physics_motor_test.npz" in names
+    assert "data/processed/physics_motor_six_metric_test_v2.npz" in names
     assert "src/elc_rl/simulation_kernel.py" in names
+    assert "src/elc_rl/discrete_loop_model.py" in names
     assert embedded["entry_count"] == len(names) - 1
     assert "scripts/train_sac.py" not in names
     assert "scripts/select_final_candidate.py" not in names
@@ -76,11 +77,13 @@ def test_single_upload_release_contains_separate_inner_archives(tmp_path):
     assert "scripts/train_all_seeds.py" in training_names
     assert "src/elc_rl/parallel_env.py" in training_names
     assert "src/elc_rl/simulation_kernel.py" in training_names
+    assert "src/elc_rl/discrete_loop_model.py" in training_names
     assert not any("physics_motor_test" in name for name in training_names)
     assert not any("frf_tasks" in name for name in training_names)
     assert "src/elc_rl/task_dataset.py" not in training_names
-    assert "data/processed/physics_motor_test.npz" in final_test_names
+    assert "data/processed/physics_motor_six_metric_test_v2.npz" in final_test_names
     assert "src/elc_rl/simulation_kernel.py" in final_test_names
+    assert "src/elc_rl/discrete_loop_model.py" in final_test_names
     assert "scripts/train_sac.py" not in final_test_names
     assert not any("frf_tasks" in name for name in final_test_names)
     assert "src/elc_rl/task_dataset.py" not in final_test_names

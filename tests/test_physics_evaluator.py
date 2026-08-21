@@ -4,52 +4,229 @@ from pathlib import Path
 
 import numpy as np
 
+from elc_rl.discrete_loop_model import (
+    build_discrete_loop_model,
+    build_discrete_loop_models,
+)
 from elc_rl.physics_evaluator import (
+    PHYSICS_FREQUENCY_POINTS,
     PHYSICS_FRICTION_CONTEXT_PARAMETER_NAMES,
     PhysicsControllerEvaluator,
     get_physics_controller_evaluator,
     get_physics_time_domain_evaluator,
 )
-from elc_rl.physics_motor_model import MODEL_PARAMETER_NAMES
+from elc_rl.physics_motor_model import MODEL_PARAMETER_NAMES, simulate_scenario
 from elc_rl.tuning_env import PIDTuningEnv
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
+LEGACY_PUBLIC_KEY_FRAGMENTS = (
+    "iae",
+    "steady_state_error",
+    "sensitivity_peak",
+    "complementary_peak",
+    "disturbance_",
+    "control_peak",
+    "control_rms",
+    "control_slew",
+    "crossover_ratio",
+)
 
-def test_physics_frequency_baseline_is_safe_over_56_models():
+
+def _assert_no_legacy_public_keys(value):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            assert not any(fragment in key for fragment in LEGACY_PUBLIC_KEY_FRAGMENTS)
+            assert key != "splits"
+            _assert_no_legacy_public_keys(child)
+    elif isinstance(value, list):
+        for child in value:
+            _assert_no_legacy_public_keys(child)
+
+
+def test_physics_frequency_report_uses_only_the_three_frequency_table_metrics():
     evaluator = get_physics_controller_evaluator(PROJECT_ROOT)
     report = evaluator.audit(evaluator.space.initial)
     assert report["backend"] == "physics"
     assert report["evaluated_model_count"] == 56
     assert report["safety"]["safe"]
-    expected = {
-        "current_reference": 400.0,
-        "speed_train": 40.0,
-        "position_surrogate": 10.0,
-    }
-    for split, target in expected.items():
-        summary = report["splits"][split]
-        assert summary["stable_fraction"] == 1.0
-        assert np.isclose(summary["crossover_hz_median"], target, rtol=0.16)
-    assert report["safety"]["current_to_speed_crossover_ratio"] >= 4.0
-    assert report["safety"]["speed_to_position_crossover_ratio"] >= 3.0
+    assert set(report["cost"]) == {"loops", "frequency_total", "total"}
+    assert set(report["cost"]["loops"]) == {"current", "speed", "position"}
+    expected_bandwidths = {"current": 1500.0, "speed": 100.0, "position": 20.0}
+    for loop, bandwidth_hz in expected_bandwidths.items():
+        metrics = report["performance_metrics"][loop]
+        assert metrics["target"]["bandwidth_hz"] == bandwidth_hz
+        assert set(metrics["normalized_errors"]) == {
+            "bandwidth",
+            "gain_margin",
+            "phase_margin",
+        }
+        assert np.isfinite(metrics["frequency_cost"])
+    assert "crossover" not in report["cost"]
+    assert "sensitivity" not in report["cost"]
+    assert "bandwidth_hierarchy" not in report["cost"]
+    assert "dobc_idealized" not in report["cost"]
+    _assert_no_legacy_public_keys(report)
 
 
-def test_physics_nonlinear_training_report_is_safe_and_finite():
+def test_physics_time_report_uses_only_the_three_time_table_metrics():
     frequency = get_physics_controller_evaluator(PROJECT_ROOT)
     evaluator = get_physics_time_domain_evaluator(PROJECT_ROOT)
     sampled = frequency.sample_training_indices(np.random.default_rng(20260722))
     report = evaluator.train(evaluator.space.initial, sampled)
     assert report["backend"] == "physics"
     assert report["safety"]["safe"]
-    for split in ("current_reference", "speed_train", "position_surrogate"):
-        summary = report["splits"][split]
-        assert summary["stable_fraction"] == 1.0
-        assert summary["voltage_limit_ratio_worst"] <= 1.001
-        assert summary["current_limit_ratio_worst"] <= 1.001
-        assert summary["speed_limit_ratio_worst"] <= 1.001
-        assert np.isfinite(summary["friction_torque_peak_nm_worst"])
+    assert set(report["cost"]) == {"loops", "time_total", "total"}
+    for loop in ("current", "speed", "position"):
+        metrics = report["performance_metrics"][loop]
+        assert set(metrics["normalized_errors"]) == {
+            "overshoot",
+            "rise_time",
+            "settling_time",
+        }
+        assert np.isfinite(metrics["time_cost"])
+    _assert_no_legacy_public_keys(report)
+
+
+def test_dobc_changes_speed_and_position_frequency_models_but_not_current():
+    evaluator = PhysicsControllerEvaluator(PROJECT_ROOT)
+    motor = evaluator.motor(int(evaluator.training_indices[0]))
+    baseline = evaluator.space.initial.copy()
+    changed = baseline.copy()
+    changed[6] = 0.0
+    changed[7] = evaluator.space.specs[7].upper
+    original_systems = build_discrete_loop_models(
+        evaluator.config, motor, baseline
+    )
+    changed_systems = build_discrete_loop_models(evaluator.config, motor, changed)
+
+    frequencies = np.geomspace(0.1, 500.0, 256)
+    assert np.allclose(
+        original_systems["current"].open_loop_response(frequencies),
+        changed_systems["current"].open_loop_response(frequencies),
+        rtol=0.0,
+        atol=1e-12,
+    )
+    assert np.allclose(
+        original_systems["current"].closed_actual_response(frequencies),
+        changed_systems["current"].closed_actual_response(frequencies),
+        rtol=0.0,
+        atol=1e-12,
+    )
+    for name in ("speed", "position"):
+        difference = np.max(
+            np.abs(
+                original_systems[name].open_loop_response(frequencies)
+                - changed_systems[name].open_loop_response(frequencies)
+            )
+        )
+        assert difference > 1e-6
+
+
+def test_discrete_current_loop_matches_the_sampled_kernel_equations():
+    evaluator = PhysicsControllerEvaluator(PROJECT_ROOT)
+    motor = evaluator.config.nominal
+    parameters = evaluator.space.initial
+    model = build_discrete_loop_model(
+        evaluator.config, motor, parameters, "current"
+    )
+    frequency_hz = np.geomspace(0.2, 2250.0, 512)
+    dt = evaluator.config.sample_period_s
+    q = np.exp(-1j * 2.0 * np.pi * frequency_hz * dt)
+    derivative_alpha = dt / (
+        evaluator.config.derivative_filter_s["current"] + dt
+    )
+    derivative = (
+        derivative_alpha
+        / dt
+        * (1.0 - q)
+        / (1.0 - (1.0 - derivative_alpha) * q)
+    )
+    controller = (
+        parameters[8]
+        + parameters[9] * dt / (1.0 - q)
+        + parameters[10] * derivative
+    )
+    delay_alpha = dt / (motor.current_delay_s + dt)
+    actuator = delay_alpha / (1.0 - (1.0 - delay_alpha) * q)
+    electrical_pole = 1.0 - dt * motor.resistance_ohm / motor.inductance_h
+    electrical = (
+        dt
+        / motor.inductance_h
+        * q
+        / (1.0 - electrical_pole * q)
+    )
+    expected = controller * actuator * electrical
+    assert np.allclose(
+        model.open_loop_response(frequency_hz), expected, rtol=1e-10, atol=1e-9
+    )
+
+
+def test_discrete_closed_steps_match_the_nonlinear_kernel_at_small_signal():
+    evaluator = PhysicsControllerEvaluator(PROJECT_ROOT)
+    motor = evaluator.config.nominal
+    parameters = evaluator.space.initial
+    models = build_discrete_loop_models(evaluator.config, motor, parameters)
+    references = {"current": 1e-6, "speed": 1e-6, "position": 1e-7}
+    override_names = {
+        "current": "current_reference_a",
+        "speed": "speed_reference_rad_s",
+        "position": "position_reference_rad",
+    }
+    for loop, reference in references.items():
+        trace = simulate_scenario(
+            evaluator.config,
+            motor,
+            parameters,
+            loop,
+            scenario_overrides={override_names[loop]: reference},
+        )
+        # A lifted speed/position sample contains eight 25 us kernel steps.
+        # Compare at each completed loop interval, not at the held 40 kHz trace
+        # samples between outer-controller updates.
+        update_ratio = evaluator.config.controller_update_ratios[loop]
+        sampled_output = trace.output[update_ratio - 1 :: update_ratio]
+        predicted = models[loop].closed_step_response(
+            reference, sampled_output.size
+        )
+        assert np.allclose(sampled_output, predicted, rtol=1e-3, atol=1e-12)
+
+
+def test_validation_models_are_reported_but_excluded_from_frequency_cost():
+    evaluator = PhysicsControllerEvaluator(PROJECT_ROOT)
+    audit = evaluator.audit(evaluator.space.initial)
+    training_only = evaluator._evaluate(
+        evaluator.space.initial,
+        evaluator.training_indices,
+        frequency_points=PHYSICS_FREQUENCY_POINTS,
+        mode="test_training_only",
+        include_models=False,
+    )
+    assert audit["cost"] == training_only["cost"]
+    assert audit["safety"]["safe"] == training_only["safety"]["safe"]
+    assert "validation_diagnostics" in audit
+    assert audit["validation_diagnostics"]["cost"] is not audit["cost"]
+
+
+def test_validation_models_are_reported_but_excluded_from_time_cost():
+    frequency = PhysicsControllerEvaluator(PROJECT_ROOT)
+    evaluator = get_physics_time_domain_evaluator(PROJECT_ROOT)
+    nominal = int(np.flatnonzero(frequency.ensemble["is_nominal"] == 1)[0])
+    validation = int(np.flatnonzero(frequency.ensemble["role"] == "validation")[0])
+    training_only = evaluator.evaluate(
+        frequency.space.initial,
+        np.asarray([nominal], dtype=np.int64),
+        mode="test_training_only",
+    )
+    with_validation = evaluator.evaluate(
+        frequency.space.initial,
+        np.asarray([nominal, validation], dtype=np.int64),
+        mode="test_with_validation",
+    )
+    assert with_validation["cost"] == training_only["cost"]
+    assert with_validation["safety"]["safe"] == training_only["safety"]["safe"]
+    assert "validation_diagnostics" in with_validation
 
 
 def test_default_environment_uses_physics_and_one_coherent_motor():

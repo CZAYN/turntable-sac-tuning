@@ -48,7 +48,8 @@ if __name__ == "__main__":
     )
     if output.exists():
         raise FileExistsError(f"candidate lock already exists: {output}")
-    final_report = PROJECT_ROOT / "outputs" / "final_test" / "final_test_report.json"
+    spec = load_final_test_spec(PROJECT_ROOT)
+    final_report = PROJECT_ROOT / spec["output_policy"]["final_report"]
     if final_report.exists():
         raise PermissionError("final test has already been consumed")
 
@@ -56,12 +57,11 @@ if __name__ == "__main__":
         parameters = np.asarray(archive["parameters"], dtype=np.float64)
     space = load_physics_controller_parameter_space(PROJECT_ROOT)
     space.normalize(parameters)
-    spec = load_final_test_spec(PROJECT_ROOT)
     test_manifest = json.loads(
         (PROJECT_ROOT / FINAL_TEST_MANIFEST_RELATIVE_PATH).read_text(encoding="utf-8")
     )
     lock = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "training_complete_candidate_locked",
         "backend": "physics",
         "test_suite_id": spec["test_suite_id"],
@@ -83,4 +83,3 @@ if __name__ == "__main__":
         json.dumps(lock, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     print(json.dumps(lock, ensure_ascii=False, indent=2))
-

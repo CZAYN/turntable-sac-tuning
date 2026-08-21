@@ -1,4 +1,4 @@
-"""Reproducible smoke-transition data for the staged tuning environment.
+"""Reproducible pre-training transitions for the staged tuning environment.
 
 These records are reinforcement-learning experience tuples, not supervised
 labels for optimal controller gains.  Production SAC training continues to
@@ -14,10 +14,15 @@ from typing import Any, Iterable
 
 import numpy as np
 
-from .tuning_env import OBSERVATION_KEYS, PIDTuningEnv, STAGE_ORDER
+from .tuning_env import (
+    OBSERVATION_KEYS,
+    PERFORMANCE_METRIC_NAMES,
+    PIDTuningEnv,
+    STAGE_ORDER,
+)
 
 
-TRANSITION_SCHEMA_VERSION = 3
+TRANSITION_SCHEMA_VERSION = 4
 DEFAULT_TRANSITIONS_PER_STAGE = 128
 DEFAULT_SEED = 20260722
 
@@ -35,7 +40,7 @@ def _stack(rows: list[np.ndarray], dtype: np.dtype[Any]) -> np.ndarray:
 
 
 def validate_transition_archive(path: Path) -> dict[str, Any]:
-    """Validate tuple alignment, observation shapes, bounds, and finiteness."""
+    """Validate schema-4 tuple alignment, shapes, bounds, and finiteness."""
 
     with np.load(path, allow_pickle=False) as data:
         required = {
@@ -49,6 +54,10 @@ def validate_transition_archive(path: Path) -> dict[str, Any]:
             "episode_step",
             "parameters_physical",
             "next_parameters_physical",
+            "frequency_stage_cost",
+            "time_stage_cost",
+            "total_stage_cost",
+            "performance_metric_names",
         }
         missing = required.difference(data.files)
         if missing:
@@ -59,7 +68,11 @@ def validate_transition_archive(path: Path) -> dict[str, Any]:
         if count <= 0 or data["action"].shape != (count, 11):
             raise ValueError("action array must have shape (N, 11) with N > 0")
         for name in data.files:
-            if name in {"schema_version", "observation_keys"}:
+            if name in {
+                "schema_version",
+                "observation_keys",
+                "performance_metric_names",
+            }:
                 continue
             array = data[name]
             if array.shape[0] != count:
@@ -86,6 +99,16 @@ def validate_transition_archive(path: Path) -> dict[str, Any]:
                 raise ValueError(f"missing observation pair for {key}")
             if data[observation_name].shape != data[next_name].shape:
                 raise ValueError(f"observation shape mismatch for {key}")
+        if "performance_metrics" not in observation_keys:
+            raise ValueError("schema 4 requires the six-metric performance observation")
+        if data["observation__performance_metrics"].shape != (count, 18):
+            raise ValueError("performance metric observation must have shape (N, 18)")
+        metric_names = tuple(str(value) for value in data["performance_metric_names"])
+        if metric_names != PERFORMANCE_METRIC_NAMES:
+            raise ValueError("schema-4 performance metric order is invalid")
+        legacy_keys = {"metrics", "time_metrics", "frf_context"}
+        if legacy_keys.intersection(observation_keys):
+            raise ValueError("schema 4 cannot contain legacy objective observations")
         return {
             "transition_count": count,
             "observation_keys": list(observation_keys),
@@ -187,6 +210,7 @@ def generate_transition_dataset(
     arrays: dict[str, np.ndarray] = {
         "schema_version": np.asarray(TRANSITION_SCHEMA_VERSION, dtype=np.int16),
         "observation_keys": np.asarray(sorted(observations)),
+        "performance_metric_names": np.asarray(PERFORMANCE_METRIC_NAMES),
         "action": _stack(actions, np.dtype(np.float32)),
         "reward": _stack(rewards, np.dtype(np.float32)),
         "terminated": _stack(terminated_values, np.dtype(np.bool_)),
@@ -215,7 +239,7 @@ def generate_transition_dataset(
     validation = validate_transition_archive(output_path)
     manifest = {
         "schema_version": TRANSITION_SCHEMA_VERSION,
-        "task_id": "cgs_three_loop_pid_dobc",
+        "task_id": "cgs_turntable_001",
         "environment_backend": "physics",
         "archive": output_path.name,
         "sha256": _sha256(output_path),
@@ -225,9 +249,15 @@ def generate_transition_dataset(
             "10 percent zero actions"
         ),
         "data_role": (
-            "RL experience tuples for reproducibility and pipeline validation; "
+            "pre-training RL experience tuples for reproducibility and pipeline validation; "
             "not optimal-parameter labels"
         ),
+        "objective": (
+            "three loops times six literal performance metrics: closed-loop "
+            "bandwidth, gain margin, phase margin, overshoot, rise time and "
+            "settling time"
+        ),
+        "performance_metric_order": list(PERFORMANCE_METRIC_NAMES),
         "tuple_semantics": "(observation, action, reward, next_observation, terminated, truncated)",
         "stages": list(selected_stages),
         "transitions_per_stage": int(transitions_per_stage),

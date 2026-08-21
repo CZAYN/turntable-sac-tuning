@@ -5,17 +5,17 @@ import numpy as np
 
 from elc_rl.tuning_env import (
     OBSERVATION_KEYS,
+    PERFORMANCE_METRIC_NAMES,
     PIDTuningEnv,
     STAGE_INDICES,
     STAGE_ORDER,
-    TIME_METRIC_NAMES,
-    time_stage_cost,
 )
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PURE_PHYSICS_RUNTIME_FILES = (
     "config/motor_physics.json",
+    "config/controller_performance_targets.json",
     "data/processed/controller_parameter_space.json",
     "data/processed/physics_motor_ensemble.npz",
     "data/processed/physics_motor_ensemble_manifest.json",
@@ -34,6 +34,8 @@ def test_reset_is_seed_deterministic_and_observation_is_valid():
     assert set(first_observation) == set(OBSERVATION_KEYS)
     assert set(environment.observation_space.spaces) == set(OBSERVATION_KEYS)
     assert "frf_context" not in first_observation
+    assert "metrics" not in first_observation
+    assert "time_metrics" not in first_observation
     assert first_observation["sampled_frf"].shape == (96,)
     friction_context = first_observation["friction_context"]
     assert friction_context.shape == (6,)
@@ -44,14 +46,16 @@ def test_reset_is_seed_deterministic_and_observation_is_valid():
         int(np.prod(space.shape))
         for space in environment.observation_space.spaces.values()
     )
-    assert flattened_size == 179
+    assert flattened_size == 146
     for key in first_observation:
         assert np.array_equal(first_observation[key], second_observation[key])
     assert first_info["sampled_model_ids"] == second_info["sampled_model_ids"]
-    assert first_observation["time_metrics"].shape == (len(TIME_METRIC_NAMES),)
-    assert first_info["stage_cost"] == (
-        first_info["frequency_stage_cost"] + first_info["time_stage_cost"]
+    assert first_observation["performance_metrics"].shape == (
+        len(PERFORMANCE_METRIC_NAMES),
     )
+    assert len(PERFORMANCE_METRIC_NAMES) == 18
+    assert first_info["fast_valid"]
+    assert first_info["audit_valid"]
     assert first_info["fast_time_safe"]
     assert first_info["audit_time_safe"]
 
@@ -75,23 +79,52 @@ def test_environment_runs_without_measured_frf_artifacts(tmp_path):
     assert info["backend"] == "physics"
 
 
-def test_dobc_time_cost_prefers_the_configured_nominal_gain():
+def test_stage_definition_integrates_dobc_into_speed():
+    assert STAGE_ORDER == ("current", "speed", "position", "joint")
+    assert STAGE_INDICES["speed"] == (3, 4, 5, 6, 7)
+
+
+def test_reward_contains_only_six_metric_cost_terms():
     environment = PIDTuningEnv(
         PROJECT_ROOT,
-        stage="dobc",
+        stage="joint",
+        initial_perturbation=0.0,
+        audit_interval=100,
+    )
+    environment.reset(seed=31, options={"perturb": False})
+    _, reward, terminated, _, info = environment.step(
+        np.zeros(11, dtype=np.float32)
+    )
+    assert not terminated
+    components = info["reward_components"]
+    assert "action_penalty" not in components
+    assert "unsafe_penalty" not in components
+    expected = 10.0 * components["improvement"] - 0.02 * components["absolute_cost"]
+    assert np.isclose(reward, expected, rtol=1e-12, atol=1e-12)
+
+
+def test_public_candidate_audit_uses_the_same_objective():
+    environment = PIDTuningEnv(
+        PROJECT_ROOT,
+        stage="joint",
         initial_perturbation=0.0,
     )
-    environment.reset(seed=20260715, options={"perturb": False})
-    sampled = environment._sampled_indices
-    assert sampled is not None
-    baseline = environment.parameter_space.initial.copy()
-    candidate = baseline.copy()
-    candidate[6] = 0.5
-    baseline_report = environment.time_evaluator.train(baseline, sampled)
-    candidate_report = environment.time_evaluator.train(candidate, sampled)
-    assert time_stage_cost(baseline_report, "dobc") < time_stage_cost(
-        candidate_report, "dobc"
+    environment.reset(seed=32, options={"perturb": False})
+    audit = environment.audit_parameters(
+        environment.parameters,
+        full_time_domain=False,
     )
+    assert audit["valid"] == audit["safe"]
+    assert np.isfinite(audit["cost"])
+    assert set(audit) == {
+        "safe",
+        "valid",
+        "cost",
+        "frequency",
+        "time_domain",
+        "parameters",
+    }
+    assert np.array_equal(audit["parameters"], environment.parameters)
 
 
 def test_stage_action_mask_only_updates_active_parameters():
@@ -118,7 +151,7 @@ def test_custom_stage_base_parameters_are_preserved_on_reset():
     base[6] = 0.5
     environment = PIDTuningEnv(
         PROJECT_ROOT,
-        stage="dobc",
+        stage="speed",
         initial_perturbation=0.0,
         base_parameters=base,
     )
@@ -185,7 +218,7 @@ def test_exported_environment_state_restores_exact_next_transition():
     first.reset(seed=314159)
     first.step(np.full(11, 0.05, dtype=np.float32))
     state = first.export_state()
-    assert state["schema_version"] == 3
+    assert state["schema_version"] == 4
     expected = first.step(np.full(11, -0.03, dtype=np.float32))
 
     restored = PIDTuningEnv(
@@ -213,7 +246,7 @@ def test_legacy_environment_state_is_rejected():
     environment = PIDTuningEnv(PROJECT_ROOT, initial_perturbation=0.0)
     environment.reset(seed=9, options={"perturb": False})
     state = environment.export_state()
-    state["schema_version"] = 2
+    state["schema_version"] = 3
     with np.testing.assert_raises_regex(
         ValueError,
         "unsupported environment state schema",

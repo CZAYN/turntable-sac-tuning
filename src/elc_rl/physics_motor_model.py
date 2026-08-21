@@ -61,6 +61,9 @@ PHYSICS_ENSEMBLE_RELATIVE_PATH = (
 PHYSICS_ENSEMBLE_MANIFEST_RELATIVE_PATH = (
     Path("data") / "processed" / "physics_motor_ensemble_manifest.json"
 )
+PHYSICS_CONFIG_SCHEMA_VERSION = 3
+PHYSICS_ENSEMBLE_SCHEMA_VERSION = 3
+SAMPLE_PERIOD_LOOP_NAMES = ("current", "speed", "position")
 
 
 def _sha256(path: Path) -> str:
@@ -145,8 +148,44 @@ class PhysicsMotorConfig:
     nominal: MotorParameters
 
     @property
+    def sample_periods_s(self) -> dict[str, float]:
+        """Return the independent digital-controller periods in seconds."""
+
+        values = self.payload["sample_periods_s"]
+        return {loop: float(values[loop]) for loop in SAMPLE_PERIOD_LOOP_NAMES}
+
+    def sample_period_s_for(self, loop: str) -> float:
+        """Return one loop's digital update period."""
+
+        if loop not in SAMPLE_PERIOD_LOOP_NAMES:
+            raise ValueError(f"unknown controller loop: {loop}")
+        return self.sample_periods_s[loop]
+
+    @property
+    def base_sample_period_s(self) -> float:
+        """Return the plant integration/current-controller base period."""
+
+        return self.sample_period_s_for("current")
+
+    @property
     def sample_period_s(self) -> float:
-        return float(self.payload["sample_period_s"])
+        """Compatibility alias for the current-loop/base period.
+
+        New code must call :meth:`sample_period_s_for` whenever the loop is
+        known. This alias no longer means that all loops share one clock.
+        """
+
+        return self.base_sample_period_s
+
+    @property
+    def controller_update_ratios(self) -> dict[str, int]:
+        """Return integer loop update periods measured in base steps."""
+
+        base = self.base_sample_period_s
+        return {
+            loop: int(round(self.sample_period_s_for(loop) / base))
+            for loop in SAMPLE_PERIOD_LOOP_NAMES
+        }
 
     @property
     def uncertainty_fraction(self) -> dict[str, float]:
@@ -182,22 +221,39 @@ class PhysicsMotorConfig:
             ].items()
         }
 
-    @property
-    def target_crossovers_hz(self) -> dict[str, float]:
-        design = self.payload["controller_design"]
-        return {
-            "current": float(design["current_crossover_hz"]),
-            "speed": float(design["speed_crossover_hz"]),
-            "position": float(design["position_crossover_hz"]),
-        }
-
     def validate(self) -> None:
-        if int(self.payload["schema_version"]) != 2:
-            raise ValueError("unsupported physics motor configuration schema")
+        schema_version = int(self.payload.get("schema_version", -1))
+        if schema_version != PHYSICS_CONFIG_SCHEMA_VERSION:
+            if schema_version == 2 or "sample_period_s" in self.payload:
+                raise ValueError(
+                    "single-rate physics configuration/state is unsupported; "
+                    "migrate to schema 3 sample_periods_s and rebuild all "
+                    "derived physics data"
+                )
+            raise ValueError(
+                "unsupported physics motor configuration schema; expected schema 3"
+            )
         if self.payload["model_id"] != "mentor_motor_physics":
             raise ValueError("unexpected physics motor model_id")
-        if self.sample_period_s <= 0.0:
-            raise ValueError("sample_period_s must be positive")
+        raw_periods = self.payload.get("sample_periods_s")
+        if not isinstance(raw_periods, Mapping) or set(raw_periods) != set(
+            SAMPLE_PERIOD_LOOP_NAMES
+        ):
+            raise ValueError(
+                "sample_periods_s must contain exactly current, speed, and position"
+            )
+        periods = self.sample_periods_s
+        if not all(np.isfinite(value) and value > 0.0 for value in periods.values()):
+            raise ValueError("all controller sample periods must be finite and positive")
+        base = periods["current"]
+        for loop in SAMPLE_PERIOD_LOOP_NAMES:
+            ratio = periods[loop] / base
+            rounded = round(ratio)
+            if rounded < 1 or not np.isclose(ratio, rounded, rtol=0.0, atol=1e-12):
+                raise ValueError(
+                    f"{loop} sample period must be an integer multiple of the "
+                    "current/base sample period"
+                )
         friction = self.friction_model
         active_friction_model = self.active_friction_model
         if active_friction_model not in SUPPORTED_FRICTION_MODELS:
@@ -250,9 +306,6 @@ class PhysicsMotorConfig:
                 "LuGre uncertainty ranges can violate static_friction_nm >= "
                 "coulomb_friction_nm"
             )
-        targets = self.target_crossovers_hz
-        if not targets["current"] > targets["speed"] > targets["position"] > 0.0:
-            raise ValueError("controller crossover targets must be strictly nested")
         limits = self.limits
         if not (
             float(limits["hard_current_a"])
@@ -346,7 +399,14 @@ def build_physics_motor_ensemble(project_root: Path) -> dict[str, np.ndarray]:
         ]
     )
     result = {
-        "schema_version": np.asarray(2, dtype=np.int16),
+        "schema_version": np.asarray(
+            PHYSICS_ENSEMBLE_SCHEMA_VERSION, dtype=np.int16
+        ),
+        "sample_period_names": np.asarray(SAMPLE_PERIOD_LOOP_NAMES),
+        "sample_periods_s": np.asarray(
+            [config.sample_period_s_for(loop) for loop in SAMPLE_PERIOD_LOOP_NAMES],
+            dtype=np.float64,
+        ),
         "parameter_names": np.asarray(MODEL_PARAMETER_NAMES),
         "parameters": parameters,
         "model_id": model_id,
@@ -359,7 +419,7 @@ def build_physics_motor_ensemble(project_root: Path) -> dict[str, np.ndarray]:
     output.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(output, **result)
     manifest = {
-        "schema_version": 2,
+        "schema_version": PHYSICS_ENSEMBLE_SCHEMA_VERSION,
         "model_id": config.payload["model_id"],
         "config_path": str(PHYSICS_CONFIG_RELATIVE_PATH).replace("\\", "/"),
         "config_sha256": _sha256(config.path),
@@ -369,6 +429,8 @@ def build_physics_motor_ensemble(project_root: Path) -> dict[str, np.ndarray]:
         "validation_models": validation_count,
         "seed": int(ensemble_spec["seed"]),
         "parameter_names": list(MODEL_PARAMETER_NAMES),
+        "sample_periods_s": config.sample_periods_s,
+        "controller_update_ratios": config.controller_update_ratios,
         "uncertainty_fraction": config.uncertainty_fraction,
         "nominal_model_included": True,
         "measured_frf_used_for_fitting": False,
@@ -393,9 +455,11 @@ def load_physics_motor_ensemble(project_root: Path) -> dict[str, np.ndarray]:
         )
     with np.load(path, allow_pickle=False) as archive:
         ensemble = {name: archive[name] for name in archive.files}
-    if int(np.asarray(ensemble["schema_version"]).item()) != 2:
+    schema_version = int(np.asarray(ensemble["schema_version"]).item())
+    if schema_version != PHYSICS_ENSEMBLE_SCHEMA_VERSION:
         raise ValueError(
-            "unsupported physics ensemble schema; rebuild the 13-parameter ensemble"
+            "single-rate or stale physics ensemble state is unsupported; rebuild "
+            "the schema 3 multi-rate 13-parameter ensemble"
         )
     if tuple(ensemble["parameter_names"].tolist()) != MODEL_PARAMETER_NAMES:
         raise ValueError("physics ensemble parameter order is invalid")
@@ -403,6 +467,20 @@ def load_physics_motor_ensemble(project_root: Path) -> dict[str, np.ndarray]:
     if parameters.ndim != 2 or parameters.shape[1] != len(MODEL_PARAMETER_NAMES):
         raise ValueError("physics ensemble matrix has an invalid shape")
     config = load_physics_motor_config(root)
+    if tuple(ensemble["sample_period_names"].tolist()) != SAMPLE_PERIOD_LOOP_NAMES:
+        raise ValueError("physics ensemble sample-period order is invalid")
+    expected_periods = np.asarray(
+        [config.sample_period_s_for(loop) for loop in SAMPLE_PERIOD_LOOP_NAMES],
+        dtype=np.float64,
+    )
+    if not np.array_equal(
+        np.asarray(ensemble["sample_periods_s"], dtype=np.float64),
+        expected_periods,
+    ):
+        raise ValueError(
+            "physics ensemble sample periods do not match the active configuration; "
+            "rebuild the ensemble"
+        )
     _validate_motor_parameter_matrix(parameters, config.active_friction_model)
     if np.count_nonzero(ensemble["is_nominal"]) != 1:
         raise ValueError("physics ensemble must contain exactly one nominal model")
@@ -455,14 +533,14 @@ def simulate_scenario(
     seed: int = 0,
     scenario_overrides: Mapping[str, float] | None = None,
 ) -> SimulationTrace:
-    """Run one deterministic cascaded PIDF/DOBC scenario at the 200 us step."""
+    """Run one deterministic cascaded PIDF/DOBC multi-rate scenario."""
 
     if scenario not in {"current", "speed", "position", "disturbance"}:
         raise ValueError(f"unknown simulation scenario: {scenario}")
     motor.validate(friction_model=config.active_friction_model)
     values = np.asarray(controller_parameters, dtype=np.float64)
     _controller_vector(values)
-    dt = config.sample_period_s
+    dt = config.base_sample_period_s
     scenario_spec = config.scenarios
     if scenario_overrides is not None:
         allowed_overrides = {
@@ -522,7 +600,14 @@ def simulate_scenario(
         terminated,
     ) = simulate_scenario_kernel(
         scenario_codes[scenario],
-        dt,
+        np.asarray(
+            [
+                config.sample_period_s_for("current"),
+                config.sample_period_s_for("speed"),
+                config.sample_period_s_for("position"),
+            ],
+            dtype=np.float64,
+        ),
         points,
         values,
         np.asarray(

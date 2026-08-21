@@ -1,0 +1,333 @@
+{
+  "schema_version": 1,
+  "run_kind": "non_training_continuous_current_uncertainty_refinement",
+  "created_at_utc": "2026-08-21T04:06:12.549035+00:00",
+  "source_report": "D:\\VSCODE Program\\cgs_rl_tuner\\outputs\\multirate_current_feasibility_40khz_exact_20260821\\multirate_feasibility_report.json",
+  "formal_configuration_modified": false,
+  "formal_parameter_space_modified": false,
+  "sac_training_executed": false,
+  "refinements": [
+    {
+      "sample_rate_hz": 40000.0,
+      "sample_period_s": 2.5e-05,
+      "sample_periods_s": {
+        "current": 2.5e-05,
+        "speed": 0.0002,
+        "position": 0.0002
+      },
+      "current_parameters": {
+        "kpcurr": 18.592976023848415,
+        "kicurr": 2291.0460232311084,
+        "kdcurr": 0.0029121653988542578
+      },
+      "continuous_box_search": {
+        "variables": [
+          "inductance",
+          "resistance",
+          "current_delay"
+        ],
+        "normalized_bounds": [
+          -1.0,
+          1.0
+        ],
+        "maxiter": 20,
+        "popsize_multiplier": 8,
+        "total_objective_evaluations": 2908,
+        "heuristic_not_mathematical_proof": true
+      },
+      "extrema": {
+        "minimum_bandwidth_hz": {
+          "value": 1375.7925704209301,
+          "normalized_uncertainty": {
+            "inductance": 1.0,
+            "resistance": 1.0,
+            "current_delay": 1.0
+          },
+          "physical_parameters": {
+            "inductance_h": 0.0028423500000000004,
+            "resistance_ohm": 5.24265,
+            "current_delay_s": 0.00022000000000000003
+          },
+          "frequency": {
+            "metric_valid": true,
+            "bandwidth_hz": 1375.7925704209301,
+            "bandwidth_found": true,
+            "gain_margin_db": 120.0,
+            "phase_margin_deg": 68.70528392003956,
+            "maximum_pole_magnitude": 0.997532299610875
+          },
+          "time_domain": {
+            "time_domain_stable": true,
+            "rise_time_s": 0.008125,
+            "settling_time_s": 0.024475,
+            "settled": true,
+            "reached_10_percent": true,
+            "reached_90_percent": true,
+            "reference_metric_valid": true,
+            "overshoot_ratio": 0.0
+          },
+          "objective_evaluations": 512
+        },
+        "maximum_bandwidth_hz": {
+          "value": 1636.6724190012346,
+          "normalized_uncertainty": {
+            "inductance": -1.0,
+            "resistance": -1.0,
+            "current_delay": -1.0
+          },
+          "physical_parameters": {
+            "inductance_h": 0.00257165,
+            "resistance_ohm": 4.74335,
+            "current_delay_s": 0.00018
+          },
+          "frequency": {
+            "metric_valid": true,
+            "bandwidth_hz": 1636.6724190012346,
+            "bandwidth_found": true,
+            "gain_margin_db": 120.0,
+            "phase_margin_deg": 65.75744859840651,
+            "maximum_pole_magnitude": 0.9974827154912989
+          },
+          "time_domain": {
+            "time_domain_stable": true,
+            "rise_time_s": 0.007225,
+            "settling_time_s": 0.02325,
+            "settled": true,
+            "reached_10_percent": true,
+            "reached_90_percent": true,
+            "reference_metric_valid": true,
+            "overshoot_ratio": 0.0
+          },
+          "objective_evaluations": 512
+        },
+        "minimum_gain_margin_db": {
+          "value": 120.0,
+          "normalized_uncertainty": {
+            "inductance": -0.02205126058327167,
+            "resistance": -0.42361630803267736,
+            "current_delay": -0.8668130809581978
+          },
+          "physical_parameters": {
+            "inductance_h": 0.0027040153618800543,
+            "resistance_ohm": 4.8872441886996425,
+            "current_delay_s": 0.00018266373838083606
+          },
+          "frequency": {
+            "metric_valid": true,
+            "bandwidth_hz": 1562.962918249875,
+            "bandwidth_found": true,
+            "gain_margin_db": 120.0,
+            "phase_margin_deg": 67.18066283997857,
+            "maximum_pole_magnitude": 0.9974970950549857
+          },
+          "time_domain": {
+            "time_domain_stable": true,
+            "rise_time_s": 0.007475,
+            "settling_time_s": 0.023625,
+            "settled": true,
+            "reached_10_percent": true,
+            "reached_90_percent": true,
+            "reference_metric_valid": true,
+            "overshoot_ratio": 0.0
+          },
+          "objective_evaluations": 52
+        },
+        "minimum_phase_margin_deg": {
+          "value": 65.01095538481891,
+          "normalized_uncertainty": {
+            "inductance": -1.0,
+            "resistance": -1.0,
+            "current_delay": 1.0
+          },
+          "physical_parameters": {
+            "inductance_h": 0.00257165,
+            "resistance_ohm": 4.74335,
+            "current_delay_s": 0.00022000000000000003
+          },
+          "frequency": {
+            "metric_valid": true,
+            "bandwidth_hz": 1496.5101952713883,
+            "bandwidth_found": true,
+            "gain_margin_db": 120.0,
+            "phase_margin_deg": 65.01095538481891,
+            "maximum_pole_magnitude": 0.9974806506167387
+          },
+          "time_domain": {
+            "time_domain_stable": true,
+            "rise_time_s": 0.007175,
+            "settling_time_s": 0.023200000000000002,
+            "settled": true,
+            "reached_10_percent": true,
+            "reached_90_percent": true,
+            "reference_metric_valid": true,
+            "overshoot_ratio": 0.0
+          },
+          "objective_evaluations": 512
+        },
+        "maximum_pole_magnitude": {
+          "value": 0.9975371919299708,
+          "normalized_uncertainty": {
+            "inductance": -0.9739816882865419,
+            "resistance": 0.9990423806301884,
+            "current_delay": -0.9523786251174
+          },
+          "physical_parameters": {
+            "inductance_h": 0.002575171578490417,
+            "resistance_ohm": 5.2424109303243265,
+            "current_delay_s": 0.000180952427497652
+          },
+          "frequency": {
+            "metric_valid": true,
+            "bandwidth_hz": 1613.9791047015526,
+            "bandwidth_found": true,
+            "gain_margin_db": 120.0,
+            "phase_margin_deg": 67.57882263750433,
+            "maximum_pole_magnitude": 0.9975371919299708
+          },
+          "time_domain": {
+            "time_domain_stable": true,
+            "rise_time_s": 0.0082,
+            "settling_time_s": 0.024575,
+            "settled": true,
+            "reached_10_percent": true,
+            "reached_90_percent": true,
+            "reference_metric_valid": true,
+            "overshoot_ratio": 0.0
+          },
+          "objective_evaluations": 512
+        },
+        "maximum_overshoot_ratio": {
+          "value": 0.0,
+          "normalized_uncertainty": {
+            "inductance": -0.2248829860394317,
+            "resistance": -0.08893855603222556,
+            "current_delay": 0.18993928891662204
+          },
+          "physical_parameters": {
+            "inductance_h": 0.0026765620878395633,
+            "resistance_ohm": 4.970796489486555,
+            "current_delay_s": 0.00020379878577833247
+          },
+          "frequency": {
+            "metric_valid": true,
+            "bandwidth_hz": 1498.3294047597738,
+            "bandwidth_found": true,
+            "gain_margin_db": 120.0,
+            "phase_margin_deg": 66.83757858557404,
+            "maximum_pole_magnitude": 0.9975054852263874
+          },
+          "time_domain": {
+            "time_domain_stable": true,
+            "rise_time_s": 0.007625,
+            "settling_time_s": 0.023825000000000002,
+            "settled": true,
+            "reached_10_percent": true,
+            "reached_90_percent": true,
+            "reference_metric_valid": true,
+            "overshoot_ratio": 0.0
+          },
+          "objective_evaluations": 52
+        },
+        "maximum_rise_time_s": {
+          "value": 0.008175,
+          "normalized_uncertainty": {
+            "inductance": -0.9871122079616836,
+            "resistance": 0.9729163046073461,
+            "current_delay": 0.04430453675227142
+          },
+          "physical_parameters": {
+            "inductance_h": 0.002573394362652386,
+            "resistance_ohm": 5.235888555445224,
+            "current_delay_s": 0.00020088609073504543
+          },
+          "frequency": {
+            "metric_valid": true,
+            "bandwidth_hz": 1541.8161957899752,
+            "bandwidth_found": true,
+            "gain_margin_db": 120.0,
+            "phase_margin_deg": 67.19891131350664,
+            "maximum_pole_magnitude": 0.9975354431811173
+          },
+          "time_domain": {
+            "time_domain_stable": true,
+            "rise_time_s": 0.008175,
+            "settling_time_s": 0.024550000000000002,
+            "settled": true,
+            "reached_10_percent": true,
+            "reached_90_percent": true,
+            "reference_metric_valid": true,
+            "overshoot_ratio": 0.0
+          },
+          "objective_evaluations": 316
+        },
+        "maximum_settling_time_s": {
+          "value": 0.024575,
+          "normalized_uncertainty": {
+            "inductance": -0.6352270101417261,
+            "resistance": 0.993124944461558,
+            "current_delay": -0.9061797783990224
+          },
+          "physical_parameters": {
+            "inductance_h": 0.0026210220241773175,
+            "resistance_ohm": 5.240933642384828,
+            "current_delay_s": 0.00018187640443201956
+          },
+          "frequency": {
+            "metric_valid": true,
+            "bandwidth_hz": 1589.7593639795787,
+            "bandwidth_found": true,
+            "gain_margin_db": 120.0,
+            "phase_margin_deg": 67.88484966585885,
+            "maximum_pole_magnitude": 0.9975365010557422
+          },
+          "time_domain": {
+            "time_domain_stable": true,
+            "rise_time_s": 0.008175,
+            "settling_time_s": 0.024575,
+            "settled": true,
+            "reached_10_percent": true,
+            "reached_90_percent": true,
+            "reference_metric_valid": true,
+            "overshoot_ratio": 0.0
+          },
+          "objective_evaluations": 388
+        },
+        "maximum_six_metric_violation": {
+          "value": 0.0,
+          "normalized_uncertainty": {
+            "inductance": -0.0949293502647679,
+            "resistance": -0.7444681560150785,
+            "current_delay": -0.3788755708859721
+          },
+          "physical_parameters": {
+            "inductance_h": 0.002694151312441664,
+            "resistance_ohm": 4.807143524850836,
+            "current_delay_s": 0.00019242248858228054
+          },
+          "frequency": {
+            "metric_valid": true,
+            "bandwidth_hz": 1535.120248853052,
+            "bandwidth_found": true,
+            "gain_margin_db": 120.0,
+            "phase_margin_deg": 66.57707376945169,
+            "maximum_pole_magnitude": 0.9974878137047364
+          },
+          "time_domain": {
+            "time_domain_stable": true,
+            "rise_time_s": 0.007325,
+            "settling_time_s": 0.023375,
+            "settled": true,
+            "reached_10_percent": true,
+            "reached_90_percent": true,
+            "reference_metric_valid": true,
+            "overshoot_ratio": 0.0
+          },
+          "objective_evaluations": 52
+        }
+      },
+      "continuous_box_frequency_pass": true,
+      "continuous_box_all_six_pass": true
+    }
+  ],
+  "hardware_use_allowed": false
+}

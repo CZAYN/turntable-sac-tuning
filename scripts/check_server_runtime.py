@@ -23,7 +23,7 @@ from elc_rl.tuning_env import PIDTuningEnv  # noqa: E402
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Validate a server before launching formal SAC training."
+        description="Validate a Python runtime before launching formal SAC training."
     )
     parser.add_argument("--project-root", type=Path, default=PROJECT_ROOT)
     parser.add_argument("--config", type=Path, default=None)

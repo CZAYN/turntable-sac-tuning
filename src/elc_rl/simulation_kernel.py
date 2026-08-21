@@ -143,7 +143,7 @@ def _pid_update(
 @njit(cache=True, nogil=True)
 def simulate_scenario_kernel(
     scenario_code: int,
-    sample_period_s: float,
+    sample_periods_s: np.ndarray,
     point_count: int,
     controller_parameters: np.ndarray,
     derivative_filters_s: np.ndarray,
@@ -172,9 +172,33 @@ def simulate_scenario_kernel(
     int,
     bool,
 ]:
-    """Run one deterministic scenario using only primitive numerical inputs."""
+    """Run one deterministic multi-rate scenario using primitive inputs.
 
-    dt = sample_period_s
+    ``sample_periods_s`` is ordered as current, speed, position. The current
+    period is the plant/LuGre integration base step. Speed, position and DOBC
+    execute on integer base-step boundaries and their outputs are held between
+    updates.
+    """
+
+    if sample_periods_s.ndim != 1 or sample_periods_s.size != 3:
+        raise ValueError("sample periods must have current, speed, position")
+    current_dt = sample_periods_s[0]
+    speed_dt = sample_periods_s[1]
+    position_dt = sample_periods_s[2]
+    if current_dt <= 0.0 or speed_dt <= 0.0 or position_dt <= 0.0:
+        raise ValueError("sample periods must be positive")
+    speed_ratio_float = speed_dt / current_dt
+    position_ratio_float = position_dt / current_dt
+    speed_update_ratio = int(round(speed_ratio_float))
+    position_update_ratio = int(round(position_ratio_float))
+    if (
+        speed_update_ratio < 1
+        or position_update_ratio < 1
+        or abs(speed_ratio_float - speed_update_ratio) > 1e-12
+        or abs(position_ratio_float - position_update_ratio) > 1e-12
+    ):
+        raise ValueError("outer-loop periods must be integer current-step multiples")
+    dt = current_dt
     time_s = np.arange(point_count, dtype=np.float64) * dt
     output = np.zeros(point_count, dtype=np.float64)
     reference = np.zeros(point_count, dtype=np.float64)
@@ -260,29 +284,44 @@ def simulate_scenario_kernel(
     previous_theta_observed = 0.0
     previous_omega_feedback = 0.0
     estimated_load = 0.0
+    speed_command = 0.0
+    iq_reference = 0.0
+    theta_observed = 0.0
     bristle_state = initial_bristle_state if friction_mode == 1 else 0.0
     saturation_count = 0
     terminated = False
 
     current_delay_alpha = dt / (current_delay_s + dt)
-    speed_delay_alpha = dt / (speed_measurement_delay_s + dt)
-    position_delay_alpha = dt / (position_measurement_delay_s + dt)
-    dobc_alpha = dt / (dobc_time + dt)
+    speed_delay_alpha = speed_dt / (speed_measurement_delay_s + speed_dt)
+    position_delay_alpha = position_dt / (
+        position_measurement_delay_s + position_dt
+    )
+    dobc_alpha = speed_dt / (dobc_time + speed_dt)
 
     for index in range(point_count):
         now = time_s[index]
-        theta_feedback += position_delay_alpha * (theta - theta_feedback)
-        if encoder_noise.size:
-            theta_observed = theta_feedback + encoder_noise[index] * encoder_lsb
-            theta_observed = np.round(theta_observed / encoder_lsb) * encoder_lsb
-            encoder_speed = (theta_observed - previous_theta_observed) / dt
-            omega_feedback += speed_delay_alpha * (
-                encoder_speed - omega_feedback
-            )
-        else:
-            theta_observed = theta_feedback
-            omega_feedback += speed_delay_alpha * (omega - omega_feedback)
-        previous_theta_observed = theta_observed
+        position_update = index % position_update_ratio == 0
+        speed_update = index % speed_update_ratio == 0
+
+        if position_update:
+            theta_feedback += position_delay_alpha * (theta - theta_feedback)
+            if encoder_noise.size:
+                theta_observed = theta_feedback + encoder_noise[index] * encoder_lsb
+                theta_observed = np.round(theta_observed / encoder_lsb) * encoder_lsb
+            else:
+                theta_observed = theta_feedback
+
+        if speed_update:
+            if encoder_noise.size:
+                encoder_speed = (
+                    theta_observed - previous_theta_observed
+                ) / speed_dt
+                omega_feedback += speed_delay_alpha * (
+                    encoder_speed - omega_feedback
+                )
+                previous_theta_observed = theta_observed
+            else:
+                omega_feedback += speed_delay_alpha * (omega - omega_feedback)
 
         if scenario_code == SCENARIO_CURRENT:
             iq_reference = requested_current
@@ -290,78 +329,83 @@ def simulate_scenario_kernel(
             reference[index] = requested_current
         else:
             if scenario_code == SCENARIO_POSITION:
-                position_error = (
-                    (requested_position - theta_observed + np.pi)
-                    % (2.0 * np.pi)
-                    - np.pi
-                )
-                (
-                    speed_command,
-                    speed_unsaturated,
-                    position_integral,
-                    position_derivative,
-                    position_previous_error,
-                ) = _pid_update(
-                    position_error,
-                    position_kp,
-                    position_ki,
-                    position_kd,
-                    derivative_filters_s[0],
-                    dt,
-                    position_integral,
-                    position_derivative,
-                    position_previous_error,
-                    -speed_command_limit,
-                    speed_command_limit,
-                )
-                saturation_count += int(
-                    not _isclose_scalar(speed_command, speed_unsaturated)
-                )
+                if position_update:
+                    position_error = (
+                        (requested_position - theta_observed + np.pi)
+                        % (2.0 * np.pi)
+                        - np.pi
+                    )
+                    (
+                        speed_command,
+                        speed_unsaturated,
+                        position_integral,
+                        position_derivative,
+                        position_previous_error,
+                    ) = _pid_update(
+                        position_error,
+                        position_kp,
+                        position_ki,
+                        position_kd,
+                        derivative_filters_s[0],
+                        position_dt,
+                        position_integral,
+                        position_derivative,
+                        position_previous_error,
+                        -speed_command_limit,
+                        speed_command_limit,
+                    )
+                    saturation_count += int(
+                        not _isclose_scalar(speed_command, speed_unsaturated)
+                    )
                 reference[index] = requested_position
             else:
                 speed_command = requested_speed
                 reference[index] = requested_speed
 
-            speed_error = speed_command - omega_feedback
-            (
-                iq_pid,
-                iq_unsaturated,
-                speed_integral,
-                speed_derivative,
-                speed_previous_error,
-            ) = _pid_update(
-                speed_error,
-                speed_kp,
-                speed_ki,
-                speed_kd,
-                derivative_filters_s[1],
-                dt,
-                speed_integral,
-                speed_derivative,
-                speed_previous_error,
-                -current_limit,
-                current_limit,
-            )
-            saturation_count += int(
-                not _isclose_scalar(iq_pid, iq_unsaturated)
-            )
-            measured_acceleration = (
-                omega_feedback - previous_omega_feedback
-            ) / dt
-            raw_load_estimate = nominal_torque_constant * i_a - (
-                nominal_inertia * measured_acceleration
-                + nominal_viscous_friction * omega_feedback
-            )
-            estimated_load += dobc_alpha * (raw_load_estimate - estimated_load)
-            iq_reference_unsaturated = (
-                iq_pid + dobc_gain / nominal_torque_constant * estimated_load
-            )
-            iq_reference = _clip_scalar(
-                iq_reference_unsaturated, -current_limit, current_limit
-            )
-            saturation_count += int(
-                not _isclose_scalar(iq_reference, iq_reference_unsaturated)
-            )
+            if speed_update:
+                speed_error = speed_command - omega_feedback
+                (
+                    iq_pid,
+                    iq_unsaturated,
+                    speed_integral,
+                    speed_derivative,
+                    speed_previous_error,
+                ) = _pid_update(
+                    speed_error,
+                    speed_kp,
+                    speed_ki,
+                    speed_kd,
+                    derivative_filters_s[1],
+                    speed_dt,
+                    speed_integral,
+                    speed_derivative,
+                    speed_previous_error,
+                    -current_limit,
+                    current_limit,
+                )
+                saturation_count += int(
+                    not _isclose_scalar(iq_pid, iq_unsaturated)
+                )
+                measured_acceleration = (
+                    omega_feedback - previous_omega_feedback
+                ) / speed_dt
+                raw_load_estimate = nominal_torque_constant * i_a - (
+                    nominal_inertia * measured_acceleration
+                    + nominal_viscous_friction * omega_feedback
+                )
+                estimated_load += dobc_alpha * (
+                    raw_load_estimate - estimated_load
+                )
+                iq_reference_unsaturated = (
+                    iq_pid + dobc_gain / nominal_torque_constant * estimated_load
+                )
+                iq_reference = _clip_scalar(
+                    iq_reference_unsaturated, -current_limit, current_limit
+                )
+                saturation_count += int(
+                    not _isclose_scalar(iq_reference, iq_reference_unsaturated)
+                )
+                previous_omega_feedback = omega_feedback
 
         current_error = iq_reference - i_a
         (
@@ -448,7 +492,6 @@ def simulate_scenario_kernel(
             primary_control[index] = iq_reference
             output[index] = omega
 
-        previous_omega_feedback = omega_feedback
         if (
             abs(omega) > termination_speed
             or not math.isfinite(i_a)

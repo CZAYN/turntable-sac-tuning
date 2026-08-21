@@ -1,4 +1,6 @@
-# CGS 转台正式 SAC 服务器训练
+# CGS 转台正式 SAC 服务器训练（Legacy）
+
+> **历史文档，不是当前执行入口。** 本文记录旧服务器环境与操作方式，尚未按当前六指标、四阶段、146维 observation 协议重新验证。当前项目转为 Windows 本机 `D:\OtherSoftware\elc_RL`，训练前操作以 `LOCAL_SETUP.md` 为准。旧服务器 checkpoint、Replay Buffer、候选与输出不可用于当前协议。
 
 本训练包只用于基于 `physics` 的正式长程训练。它不包含封存测试数据，也不使用冒烟训练产生的模型或输出。
 

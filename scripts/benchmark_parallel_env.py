@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing
 from pathlib import Path
 import sys
 import time
@@ -16,8 +17,8 @@ from elc_rl.parallel_env import (  # noqa: E402
     configure_thread_limits,
     create_training_vec_env,
 )
-from elc_rl.physics_evaluator import get_physics_controller_evaluator  # noqa: E402
 from elc_rl.sac_training import load_formal_training_config  # noqa: E402
+from elc_rl.tuning_env import PIDTuningEnv, STAGE_ORDER  # noqa: E402
 
 
 def main() -> int:
@@ -28,7 +29,7 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=None)
     parser.add_argument("--n-envs", type=int, default=None)
     parser.add_argument("--steps-per-env", type=int, default=64)
-    parser.add_argument("--stage", default="joint")
+    parser.add_argument("--stage", choices=STAGE_ORDER, default="joint")
     arguments = parser.parse_args()
 
     root = arguments.project_root.resolve()
@@ -47,7 +48,17 @@ def main() -> int:
     )
     configure_thread_limits(thread_count)
     environment_config = config.payload["environment"]
-    base_parameters = get_physics_controller_evaluator(root).space.initial
+    bootstrap = PIDTuningEnv(
+        root,
+        stage=str(arguments.stage),
+        max_episode_steps=int(environment_config["max_episode_steps"]),
+        audit_interval=int(environment_config["audit_interval"]),
+        initial_perturbation=0.0,
+    )
+    try:
+        base_parameters = bootstrap.parameter_space.initial.copy()
+    finally:
+        bootstrap.close()
     environment = create_training_vec_env(
         root,
         stage=str(arguments.stage),
@@ -89,4 +100,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     raise SystemExit(main())

@@ -91,18 +91,20 @@ $$
 参数写入后依次执行：
 
 ```bash
-python scripts/build_physics_model.py
+python scripts/build_physics_model.py \
+  --current-feasibility-report \
+  data/processed/current_pidf_feasibility_40khz/multirate_feasibility_report.json
 python scripts/build_final_test_dataset.py --overwrite-unconsumed
 python -m pytest -q
 python scripts/check_tuning_env.py --quick
 ```
 
-随后必须使用新的实验目录重新训练。179维 observation、13维物理模型集合、Replay Buffer、transition 数据和环境状态都不能与旧训练协议混用。
+随后必须使用新的实验目录重新训练。146维 observation、13维物理模型集合、Replay Buffer、transition 数据和环境状态都不能与旧训练协议混用。
 
 启用前必须检查：
 
 - 正负速度下摩擦方向正确；
 - 零速状态能够保留合理的预滑动记忆；
 - 反转过程连续、无 NaN 或数值爆炸；
-- `0.0002 s` 与更小时间步结果收敛；
+- `25 us` 基础步与更小时间步结果收敛，外环仍按 `200 us` 更新；
 - 低速启动、小位置运动及扰动场景不违反电流、速度和电压限制。

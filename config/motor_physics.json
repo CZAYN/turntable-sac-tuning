@@ -1,8 +1,12 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "model_id": "mentor_motor_physics",
   "description": "Single-axis FOC-decoupled servo model supplied by the mentor; all values use SI units.",
-  "sample_period_s": 0.0002,
+  "sample_periods_s": {
+    "current": 0.000025,
+    "speed": 0.0002,
+    "position": 0.0002
+  },
   "nominal_parameters": {
     "inductance_h": 0.002707,
     "resistance_ohm": 4.993,
@@ -40,9 +44,6 @@
     "sampling": "independent_stratified_uniform_with_nominal_model"
   },
   "controller_design": {
-    "current_crossover_hz": 400.0,
-    "speed_crossover_hz": 40.0,
-    "position_crossover_hz": 10.0,
     "position_integral_ratio_at_crossover": 0.2,
     "derivative_ratio_at_crossover": 0.05,
     "derivative_filter_s": {
@@ -91,9 +92,9 @@
     "speed_reference_rad_s": 1.0,
     "position_reference_rad": 0.002,
     "load_torque_step_nm": 0.040825,
-    "current_duration_s": 0.02,
-    "speed_duration_s": 0.5,
-    "position_duration_s": 1.0,
+    "current_duration_s": 0.2,
+    "speed_duration_s": 2.0,
+    "position_duration_s": 2.0,
     "disturbance_duration_s": 0.5,
     "disturbance_start_s": 0.15
   },

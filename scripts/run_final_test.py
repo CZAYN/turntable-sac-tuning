@@ -48,9 +48,12 @@ if __name__ == "__main__":
     if not all(bool(value) for value in lock["declarations"].values()):
         raise ValueError("candidate lock declarations are incomplete")
 
-    output_dir = PROJECT_ROOT / "outputs" / "final_test"
-    report_path = output_dir / "final_test_report.json"
-    marker_path = output_dir / "FINAL_TEST_CONSUMED.json"
+    output_policy = spec["output_policy"]
+    report_path = PROJECT_ROOT / Path(output_policy["final_report"])
+    marker_path = PROJECT_ROOT / Path(output_policy["consumption_marker"])
+    if report_path.parent != marker_path.parent:
+        raise ValueError("final report and consumption marker must share a directory")
+    output_dir = report_path.parent
     if report_path.exists() or marker_path.exists():
         raise PermissionError(
             "final-test suite has already been consumed; repeat evaluation is forbidden"
@@ -58,12 +61,15 @@ if __name__ == "__main__":
     output_dir.mkdir(parents=True, exist_ok=False)
     started_at = datetime.now(timezone.utc).isoformat()
     marker = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "started_test_suite_consumed",
         "test_suite_id": spec["test_suite_id"],
         "candidate_file_sha256": _sha256(candidate),
         "candidate_lock_sha256": _sha256(candidate_lock_path),
         "test_ensemble_sha256": test_manifest["test_ensemble_sha256"],
+        "performance_targets_sha256": test_manifest[
+            "performance_targets_sha256"
+        ],
         "started_at_utc": started_at,
     }
     marker_path.write_text(
@@ -79,6 +85,9 @@ if __name__ == "__main__":
         "candidate_lock_path": str(candidate_lock_path),
         "candidate_lock_sha256": marker["candidate_lock_sha256"],
         "test_ensemble_sha256": marker["test_ensemble_sha256"],
+        "performance_targets_sha256": marker[
+            "performance_targets_sha256"
+        ],
         "started_at_utc": started_at,
         "completed_at_utc": datetime.now(timezone.utc).isoformat(),
     }

@@ -14,20 +14,23 @@ FINAL_TEST_PACKAGE_FILES = (
     "pyproject.toml",
     "config/motor_physics.json",
     "config/final_test_spec.json",
+    "config/controller_performance_targets.json",
     "data/processed/controller_parameter_space.json",
     "data/processed/physics_motor_ensemble.npz",
     "data/processed/physics_motor_ensemble_manifest.json",
-    "data/processed/physics_motor_test.npz",
-    "data/processed/physics_motor_test_manifest.json",
+    "data/processed/physics_motor_six_metric_test_v2.npz",
+    "data/processed/physics_motor_six_metric_test_v2_manifest.json",
     "scripts/lock_final_candidate.py",
     "scripts/run_final_test.py",
     "src/elc_rl/__init__.py",
     "src/elc_rl/controller_parameters.py",
+    "src/elc_rl/discrete_loop_model.py",
     "src/elc_rl/evaluation_utils.py",
     "src/elc_rl/final_test_evaluator.py",
     "src/elc_rl/physics_evaluator.py",
     "src/elc_rl/physics_motor_model.py",
     "src/elc_rl/physics_test_dataset.py",
+    "src/elc_rl/performance_targets.py",
     "src/elc_rl/simulation_kernel.py",
 )
 
@@ -72,7 +75,7 @@ def build_package(project_root: Path, output: Path, overwrite: bool) -> dict[str
         contents.append((normalized, content))
 
     internal_manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "package_kind": "physics_sealed_final_test_only",
         "data_policy": (
             "extract only after formal training, validation and candidate selection "

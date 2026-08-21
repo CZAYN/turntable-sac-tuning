@@ -1,7 +1,7 @@
 {
-  "schema_version": 1,
-  "test_suite_id": "physics_motor_final_test",
-  "description": "Sealed, test-only generalization suite for the physics three-loop PIDF and DOBC tuner.",
+  "schema_version": 2,
+  "test_suite_id": "physics_motor_six_metric_final_test_v2",
+  "description": "Sealed, test-only 24-model generalization suite for the physics three-loop PIDF controller with DOBC embedded in the speed loop.",
   "isolation_policy": {
     "allowed_consumers": [
       "scripts/run_final_test.py",
@@ -20,6 +20,7 @@
   },
   "frozen_source": {
     "physics_config": "config/motor_physics.json",
+    "performance_targets": "config/controller_performance_targets.json",
     "training_validation_ensemble": "data/processed/physics_motor_ensemble.npz",
     "training_models": 40,
     "validation_models": 16,
@@ -29,7 +30,7 @@
     "model_count": 16,
     "seed": 20260723,
     "sampling": "independent_stratified_uniform",
-    "uncertainty": "inherit_exactly_from_config/motor_physics.json",
+    "uncertainty": "inherit exactly from config/motor_physics.json",
     "nominal_model_included": false,
     "minimum_normalized_chebyshev_distance_from_train_validation": 0.02
   },
@@ -119,58 +120,42 @@
       }
     ]
   },
-  "test_scenarios": {
-    "standard": {
-      "current_reference_a": 0.5,
-      "speed_reference_rad_s": 1.0,
-      "position_reference_rad": 0.002,
-      "load_torque_step_nm": 0.040825,
-      "encoder_effects": false
-    },
-    "ood_stress": {
-      "load_torque_step_nm": 0.08165,
-      "encoder_effects": true,
-      "encoder_noise_seed_base": 20260724,
-      "meaning": "stronger simulated load plus provisional 23-bit quantization/noise"
-    }
+  "reference_steps": {
+    "current_reference_a": 0.5,
+    "speed_reference_rad_s": 1.0,
+    "position_reference_rad": 0.002,
+    "encoder_effects": false
   },
-  "acceptance_thresholds": {
-    "hard_all_24_models": {
-      "closed_loop_stable": true,
-      "maximum_voltage_limit_ratio": 1.001,
-      "maximum_current_limit_ratio": 1.001,
-      "maximum_speed_limit_ratio": 1.001,
-      "minimum_gain_margin_db": 3.0,
-      "maximum_sensitivity_peak": 3.0,
-      "minimum_current_to_speed_crossover_ratio": 4.0,
-      "minimum_speed_to_position_crossover_ratio": 3.0
-    },
-    "minimum_phase_margin_deg": {
-      "current": 20.0,
-      "speed": 20.0,
-      "position": 25.0
-    },
-    "in_distribution_performance": {
-      "maximum_settling_time_s": {
-        "current": 0.005,
-        "speed": 0.1,
-        "position": 0.3
-      },
-      "maximum_overshoot_ratio": {
-        "current": 0.15,
-        "speed": 0.1,
-        "position": 0.2
-      },
-      "maximum_steady_state_error": 0.02,
-      "maximum_standard_disturbance_peak_rad_s": 0.08,
-      "maximum_standard_disturbance_recovery_s": 0.25
-    },
-    "ood_performance_policy": "report degradation score; stability, margins, hierarchy and hard limits remain mandatory"
+  "acceptance_policy": {
+    "official_metrics_per_loop": [
+      "closed_loop_bandwidth_hz",
+      "gain_margin_db",
+      "phase_margin_deg",
+      "overshoot_ratio",
+      "rise_time_s",
+      "settling_time_s"
+    ],
+    "targets_source": "config/controller_performance_targets.json",
+    "bandwidth_reporting_tolerance_fraction": 0.1,
+    "bandwidth_tolerance_semantics": "Algorithmic reporting and pass tolerance around the stated bandwidth target; it is the same normalization scale used by the six-metric cost and is not an additional physical metric.",
+    "gain_and_phase_margins_are_minima": true,
+    "overshoot_rise_and_settling_are_maxima": true,
+    "invalid_or_nonfinite_metric_fails_model": true,
+    "all_three_loops_must_pass_per_model": true,
+    "all_24_models_must_pass_suite": true,
+    "diagnostics_outside_the_six_metrics_are_forbidden": [
+      "disturbance metrics",
+      "loop hierarchy ratios",
+      "sensitivity peak",
+      "IAE",
+      "steady-state error",
+      "control effort"
+    ]
   },
   "output_policy": {
-    "test_ensemble": "data/processed/physics_motor_test.npz",
-    "test_manifest": "data/processed/physics_motor_test_manifest.json",
-    "final_report": "outputs/final_test/final_test_report.json",
-    "consumption_marker": "outputs/final_test/FINAL_TEST_CONSUMED.json"
+    "test_ensemble": "data/processed/physics_motor_six_metric_test_v2.npz",
+    "test_manifest": "data/processed/physics_motor_six_metric_test_v2_manifest.json",
+    "final_report": "outputs/final_test_v2/final_test_report.json",
+    "consumption_marker": "outputs/final_test_v2/FINAL_TEST_CONSUMED.json"
   }
 }

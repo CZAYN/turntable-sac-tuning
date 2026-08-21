@@ -1,3 +1,10 @@
+"""Legacy single-process smoke launcher.
+
+The supported engineering check lives in ``scripts/train_sac.py``.  This
+compatibility entry point remains packageable, but uses the same four stages
+and literal six-metric audit as the formal trainer.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -44,7 +51,7 @@ class CandidatePoolCallback(BaseCallback):
 
     def _on_step(self) -> bool:
         for info in self.locals.get("infos", []):
-            if not bool(info.get("fast_safe", False)):
+            if not bool(info.get("fast_valid", False)):
                 continue
             parameters = np.asarray(info["parameters"], dtype=np.float64)
             cost = float(info["stage_cost"])
@@ -59,19 +66,14 @@ class CandidatePoolCallback(BaseCallback):
         return True
 
 
-def _time_safe(report: dict[str, Any]) -> bool:
-    stable = bool(
-        report["splits"]
-        and all(
-            float(summary["stable_fraction"]) == 1.0
-            for summary in report["splits"].values()
-        )
-    )
+def _loop_target_met(report: dict[str, Any], loop: str) -> bool:
+    primary = bool(report["performance_metrics"][loop]["target_pass"])
+    validation = report.get("validation_diagnostics")
     return bool(
-        stable
+        primary
         and (
-            "safety" not in report
-            or bool(report["safety"].get("safe", False))
+            validation is None
+            or bool(validation["performance_metrics"][loop]["target_pass"])
         )
     )
 
@@ -81,27 +83,46 @@ def _audit(
 ) -> dict[str, Any]:
     frequency_report = environment.evaluator.audit(parameters)
     time_report = environment.time_evaluator.audit(parameters)
-    frequency_safe = bool(frequency_report["safety"]["safe"])
-    time_safe = _time_safe(time_report)
+    frequency_valid = bool(frequency_report["safety"]["safe"])
+    time_valid = bool(time_report["safety"]["safe"])
+    selected_loops = (
+        ("current", "speed", "position") if stage == "joint" else (stage,)
+    )
+    loops: dict[str, Any] = {}
+    for loop in selected_loops:
+        frequency = frequency_report["performance_metrics"][loop]
+        time_domain = time_report["performance_metrics"][loop]
+        loops[loop] = {
+            "target": frequency["target"],
+            "frequency_actual": frequency["actual"],
+            "time_actual": time_domain["actual"],
+            "normalized_errors": {
+                **frequency["normalized_errors"],
+                **time_domain["normalized_errors"],
+            },
+            "frequency_cost": float(frequency["frequency_cost"]),
+            "time_cost": float(time_domain["time_cost"]),
+            "target_pass": bool(
+                _loop_target_met(frequency_report, loop)
+                and _loop_target_met(time_report, loop)
+            ),
+        }
     return {
-        "safe": bool(frequency_safe and time_safe),
-        "frequency_safe": frequency_safe,
-        "time_safe": time_safe,
-        "cost": combined_stage_cost(
-            frequency_report,
-            time_report,
-            stage,
-            environment.position_target_hz,
+        "valid": bool(frequency_valid and time_valid),
+        "frequency_valid": frequency_valid,
+        "time_valid": time_valid,
+        "all_stage_targets_met": bool(
+            all(bool(loops[loop]["target_pass"]) for loop in selected_loops)
         ),
+        "cost": combined_stage_cost(frequency_report, time_report, stage),
+        "loops": loops,
         "frequency": {
             "cost": frequency_report["cost"],
             "safety": frequency_report["safety"],
-            "splits": frequency_report["splits"],
-            "dobc": frequency_report["dobc"],
         },
         "time_domain": {
-            "splits": time_report["splits"],
-            "assumptions": time_report["assumptions"],
+            "cost": time_report["cost"],
+            "safety": time_report["safety"],
         },
     }
 
@@ -204,13 +225,15 @@ def train_staged_sac(
             audited_candidates.append(
                 (record.parameters, _audit(environment, record.parameters, stage), record.cost)
             )
-        safe_candidates = [item for item in audited_candidates if item[1]["safe"]]
+        valid_candidates = [item for item in audited_candidates if item[1]["valid"]]
         selected_parameters, selected_audit, selected_fast_cost = min(
-            safe_candidates,
+            valid_candidates or audited_candidates,
             key=lambda item: float(item[1]["cost"]),
         )
         accepted = bool(
-            float(selected_audit["cost"]) < float(baseline_audit["cost"]) - 1e-12
+            selected_audit["valid"]
+            and float(selected_audit["cost"])
+            < float(baseline_audit["cost"]) - 1e-12
         )
         curriculum_parameters = (
             selected_parameters.copy() if accepted else baseline_parameters.copy()
@@ -267,11 +290,16 @@ def train_staged_sac(
         normalized_parameters=final_environment.parameter_space.normalize(
             curriculum_parameters
         ),
-        simulation_audit_safe=np.asarray(final_audit["safe"]),
+        simulation_audit_valid=np.asarray(final_audit["valid"]),
+        all_six_targets_met=np.asarray(final_audit["all_stage_targets_met"]),
+        objective_schema_version=np.asarray(2, dtype=np.int16),
     )
     summary = {
-        "schema_version": 1,
-        "run_kind": "physics-aware GPU SAC pipeline smoke test; not converged final training",
+        "schema_version": 2,
+        "run_kind": (
+            "legacy physics-aware GPU SAC smoke test using the four-stage, "
+            "six-metric objective; not converged final training"
+        ),
         "backend": "physics",
         "stage_sequence": list(stages),
         "seed": seed,
@@ -311,7 +339,12 @@ def train_staged_sac(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run staged SAC GPU smoke training.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run the legacy staged SAC smoke check. Prefer train_sac.py "
+            "--engineering-check-steps-per-stage for new runs."
+        )
+    )
     parser.add_argument(
         "--steps-per-stage", type=int, default=DEFAULT_STEPS_PER_STAGE
     )
@@ -355,7 +388,10 @@ if __name__ == "__main__":
                 "device": result["device"],
                 "gpu_name": result["gpu_name"],
                 "replay_buffer_size": result["replay_buffer_size"],
-                "final_audit_safe": result["final_audit"]["safe"],
+                "final_audit_valid": result["final_audit"]["valid"],
+                "final_all_six_targets_met": result["final_audit"][
+                    "all_stage_targets_met"
+                ],
                 "final_audit_cost": result["final_audit"]["cost"],
             },
             ensure_ascii=False,

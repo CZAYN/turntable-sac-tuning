@@ -17,6 +17,7 @@ venv/
 .idea/
 .agents/
 .codex/
+.codex_tmp/
 
 # Generated runs, logs, and release archives
 outputs/
@@ -30,8 +31,8 @@ tmp/
 WSL旧会话记录/
 电机三环控制与强化学习调参_完整会话.md
 
-# Keep the physics training inputs plus measured FRF assets used only for
-# offline model-mismatch diagnostics. Sealed final-test inputs stay untracked.
+# Keep the physics training inputs, measured FRF assets used only for offline
+# model-mismatch diagnostics, and the versioned candidate-independent test set.
 data/*
 !data/processed/
 data/processed/*
@@ -40,3 +41,8 @@ data/processed/*
 !data/processed/frf_tasks_manifest.json
 !data/processed/physics_motor_ensemble.npz
 !data/processed/physics_motor_ensemble_manifest.json
+!data/processed/physics_motor_six_metric_test_v2.npz
+!data/processed/physics_motor_six_metric_test_v2_manifest.json
+!data/processed/current_pidf_feasibility_40khz/
+!data/processed/current_pidf_feasibility_40khz/multirate_feasibility_report.json
+!data/processed/current_pidf_feasibility_40khz/continuous_worst_case_report.json

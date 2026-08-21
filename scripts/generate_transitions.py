@@ -18,7 +18,10 @@ from elc_rl.transition_dataset import (  # noqa: E402
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Generate deterministic RL transition smoke data."
+        description=(
+            "Generate deterministic schema-4 pre-training transitions for the "
+            "four-stage, six-metric environment."
+        )
     )
     parser.add_argument(
         "--transitions-per-stage",

@@ -19,24 +19,122 @@ from elc_rl.physics_evaluator import (  # noqa: E402
     get_physics_controller_evaluator,
     get_physics_time_domain_evaluator,
 )
+from elc_rl.performance_targets import LOOP_ORDER  # noqa: E402
 from elc_rl.tuning_env import combined_stage_cost  # noqa: E402
 
 
 DEFAULT_SEED = 20260715
 
 
-def _time_safe(report: dict[str, Any]) -> bool:
-    stable = bool(
-        report["splits"]
-        and all(
-            float(summary["stable_fraction"]) == 1.0
-            for summary in report["splits"].values()
-        )
+def _report_valid(report: dict[str, Any]) -> bool:
+    """Return evaluator validity, which is distinct from meeting every target."""
+
+    return bool(report.get("safety", {}).get("safe", False))
+
+
+def _domain_targets_met(report: dict[str, Any], domain: str) -> bool:
+    key = f"all_{domain}_targets_met"
+    return bool(report.get("safety", {}).get(key, False))
+
+
+def _loop_target_met(report: dict[str, Any], loop: str) -> bool:
+    return bool(report["performance_metrics"][loop]["target_pass"])
+
+
+def _validation_summary(
+    frequency_report: dict[str, Any], time_report: dict[str, Any]
+) -> dict[str, Any] | None:
+    frequency = frequency_report.get("validation_diagnostics")
+    time_domain = time_report.get("validation_diagnostics")
+    if frequency is None or time_domain is None:
+        return None
+    loops: dict[str, Any] = {}
+    for loop in LOOP_ORDER:
+        frequency_loop = frequency["performance_metrics"][loop]
+        time_loop = time_domain["performance_metrics"][loop]
+        loops[loop] = {
+            "frequency_actual": frequency_loop["actual"],
+            "time_actual": time_loop["actual"],
+            "target_pass": bool(
+                frequency_loop["target_pass"] and time_loop["target_pass"]
+            ),
+        }
+    return {
+        "all_six_targets_met": bool(
+            frequency["safety"]["all_frequency_targets_met"]
+            and time_domain["safety"]["all_time_targets_met"]
+        ),
+        "frequency_cost": frequency["cost"],
+        "time_cost": time_domain["cost"],
+        "loops": loops,
+    }
+
+
+def _six_metric_audit(
+    frequency_report: dict[str, Any], time_report: dict[str, Any]
+) -> dict[str, Any]:
+    """Project both evaluators onto the literal 3 loops x 6 metrics."""
+
+    loops: dict[str, Any] = {}
+    for loop in LOOP_ORDER:
+        frequency = frequency_report["performance_metrics"][loop]
+        time_domain = time_report["performance_metrics"][loop]
+        loops[loop] = {
+            "target": frequency["target"],
+            "frequency_actual": frequency["actual"],
+            "time_actual": time_domain["actual"],
+            "normalized_errors": {
+                **frequency["normalized_errors"],
+                **time_domain["normalized_errors"],
+            },
+            "frequency_cost": float(frequency["frequency_cost"]),
+            "time_cost": float(time_domain["time_cost"]),
+            "combined_cost": float(
+                0.5 * frequency["frequency_cost"]
+                + 0.5 * time_domain["time_cost"]
+            ),
+            "valid": bool(frequency["valid"] and time_domain["valid"]),
+            "target_pass": bool(
+                _loop_target_met(frequency_report, loop)
+                and _loop_target_met(time_report, loop)
+            ),
+        }
+    valid = bool(_report_valid(frequency_report) and _report_valid(time_report))
+    target_pass = bool(
+        _domain_targets_met(frequency_report, "frequency")
+        and _domain_targets_met(time_report, "time")
     )
-    return bool(
-        stable
-        and ("safety" not in report or bool(report["safety"].get("safe", False)))
-    )
+    return {
+        "valid": valid,
+        "all_six_targets_met": target_pass,
+        "cost": float(combined_stage_cost(frequency_report, time_report, "joint")),
+        "loops": loops,
+        "validation": _validation_summary(frequency_report, time_report),
+        "audit_scope": {
+            "frequency_model_count": int(frequency_report["evaluated_model_count"]),
+            "time_model_count": int(time_report["evaluated_model_count"]),
+            "frequency_mode": frequency_report["evaluation_mode"],
+            "time_mode": time_report["evaluation_mode"],
+        },
+    }
+
+
+def _load_candidate(path: Path, space: Any) -> np.ndarray:
+    candidate_path = Path(path)
+    if not candidate_path.is_file():
+        raise FileNotFoundError(f"SAC candidate does not exist: {candidate_path}")
+    with np.load(candidate_path, allow_pickle=False) as data:
+        if "parameters" not in data.files:
+            raise ValueError("SAC candidate archive is missing parameters")
+        values = np.asarray(data["parameters"], dtype=np.float64)
+        if "parameter_names" in data.files:
+            names = tuple(str(value) for value in data["parameter_names"])
+            if names != tuple(space.names):
+                raise ValueError("SAC candidate parameter order does not match the project")
+    if values.shape != (len(space.names),) or not np.isfinite(values).all():
+        raise ValueError("SAC candidate parameters must be one finite 11-vector")
+    space.normalize(values)
+    return values
 
 
 def run_optimizer_baseline(
@@ -46,6 +144,7 @@ def run_optimizer_baseline(
     maxiter: int,
     popsize: int,
     output_dir: Path,
+    sac_candidate_path: Path | None = None,
 ) -> dict[str, Any]:
     if maxiter <= 0 or popsize <= 0:
         raise ValueError("maxiter and popsize must be positive")
@@ -53,9 +152,6 @@ def run_optimizer_baseline(
     frequency_evaluator = get_physics_controller_evaluator(project_root)
     time_evaluator = get_physics_time_domain_evaluator(project_root)
     space = frequency_evaluator.space
-    position_target_hz = float(
-        space.metadata["position_design"]["target_crossover_hz"]
-    )
     rng = np.random.default_rng(seed)
     sampled_indices = frequency_evaluator.sample_training_indices(rng)
     evaluation_count = 0
@@ -68,16 +164,11 @@ def run_optimizer_baseline(
             parameters = space.denormalize(np.asarray(normalized, dtype=np.float64))
             frequency_report = frequency_evaluator.train(parameters, sampled_indices)
             time_report = time_evaluator.train(parameters, sampled_indices)
-            cost = combined_stage_cost(
-                frequency_report,
-                time_report,
-                "joint",
-                position_target_hz,
+            cost = combined_stage_cost(frequency_report, time_report, "joint")
+            valid = bool(
+                _report_valid(frequency_report) and _report_valid(time_report)
             )
-            safe = bool(frequency_report["safety"]["safe"]) and _time_safe(
-                time_report
-            )
-            value = float(cost if safe else 1000.0 + cost)
+            value = float(cost if valid else 1000.0 + cost)
         except (FloatingPointError, ValueError, OverflowError):
             value = 1e6
         best_seen = min(best_seen, value)
@@ -120,30 +211,8 @@ def run_optimizer_baseline(
 
     def full_audit(parameters: np.ndarray) -> dict[str, Any]:
         frequency_report = frequency_evaluator.audit(parameters)
-        time_report = time_evaluator.audit(parameters)
-        frequency_safe = bool(frequency_report["safety"]["safe"])
-        time_safe = _time_safe(time_report)
-        return {
-            "safe": bool(frequency_safe and time_safe),
-            "frequency_safe": frequency_safe,
-            "time_safe": time_safe,
-            "cost": combined_stage_cost(
-                frequency_report,
-                time_report,
-                "joint",
-                position_target_hz,
-            ),
-            "frequency": {
-                "cost": frequency_report["cost"],
-                "safety": frequency_report["safety"],
-                "splits": frequency_report["splits"],
-                "dobc": frequency_report["dobc"],
-            },
-            "time_domain": {
-                "splits": time_report["splits"],
-                "assumptions": time_report["assumptions"],
-            },
-        }
+        time_report = time_evaluator.full_audit(parameters)
+        return _six_metric_audit(frequency_report, time_report)
 
     normalized_pool = [initial_normalized.copy(), np.asarray(result.x).copy()]
     order = np.argsort(np.asarray(result.population_energies))[:5]
@@ -169,24 +238,20 @@ def run_optimizer_baseline(
                 "audit": full_audit(parameters),
             }
         )
-    safe_candidates = [row for row in audited_candidates if row["audit"]["safe"]]
-    selected = min(safe_candidates, key=lambda row: float(row["audit"]["cost"]))
+    valid_candidates = [row for row in audited_candidates if row["audit"]["valid"]]
+    if not valid_candidates:
+        raise RuntimeError("differential evolution produced no numerically valid candidate")
+    selected = min(valid_candidates, key=lambda row: float(row["audit"]["cost"]))
     selected_parameters = np.asarray(
         [selected["parameters"][name] for name in space.names], dtype=np.float64
     )
     baseline = audited_candidates[0]
 
     sac_comparison = None
-    sac_candidate_path = (
-        project_root
-        / "outputs"
-        / "sac_smoke_physics"
-        / "final_candidate.npz"
-    )
-    if sac_candidate_path.exists():
-        with np.load(sac_candidate_path, allow_pickle=False) as data:
-            sac_parameters = np.asarray(data["parameters"], dtype=np.float64)
+    if sac_candidate_path is not None:
+        sac_parameters = _load_candidate(sac_candidate_path, space)
         sac_comparison = {
+            "candidate_path": str(Path(sac_candidate_path).resolve()),
             "parameters": {
                 name: float(value) for name, value in zip(space.names, sac_parameters)
             },
@@ -194,8 +259,9 @@ def run_optimizer_baseline(
         }
 
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "backend": "physics",
+        "objective": "literal three-loop six-metric controller target table",
         "run_kind": (
             "deterministic differential-evolution simulation baseline; "
             "limited-budget, not final convergence"
@@ -214,12 +280,13 @@ def run_optimizer_baseline(
         "optimizer_best_fast_cost": float(result.fun),
         "baseline": baseline,
         "audited_candidate_count": len(audited_candidates),
+        "valid_candidate_count": len(valid_candidates),
         "audited_candidates": audited_candidates,
         "selected": selected,
         "selected_improves_baseline": bool(
             float(selected["audit"]["cost"]) < float(baseline["audit"]["cost"])
         ),
-        "sac_smoke_comparison": sac_comparison,
+        "sac_candidate_comparison": sac_comparison,
         "hardware_use_allowed": False,
     }
     (output_dir / "differential_evolution_report.json").write_text(
@@ -230,14 +297,21 @@ def run_optimizer_baseline(
         parameter_names=np.asarray(space.names),
         parameters=selected_parameters,
         normalized_parameters=space.normalize(selected_parameters),
-        simulation_audit_safe=np.asarray(selected["audit"]["safe"]),
+        simulation_audit_valid=np.asarray(selected["audit"]["valid"]),
+        all_six_targets_met=np.asarray(
+            selected["audit"]["all_six_targets_met"]
+        ),
+        objective_schema_version=np.asarray(2, dtype=np.int16),
     )
     return report
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Run a traditional optimizer baseline for the 11D objective."
+        description=(
+            "Run a differential-evolution baseline for the 11 controller "
+            "parameters and the literal six-metric objective."
+        )
     )
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--maxiter", type=int, default=8)
@@ -246,6 +320,15 @@ if __name__ == "__main__":
         "--output-dir",
         type=Path,
         default=None,
+    )
+    parser.add_argument(
+        "--sac-candidate",
+        type=Path,
+        default=None,
+        help=(
+            "optional explicit SAC candidate .npz to audit beside the initial "
+            "parameters and differential-evolution result"
+        ),
     )
     arguments = parser.parse_args()
     output_dir = (
@@ -259,6 +342,7 @@ if __name__ == "__main__":
         maxiter=arguments.maxiter,
         popsize=arguments.popsize,
         output_dir=output_dir,
+        sac_candidate_path=arguments.sac_candidate,
     )
     print(
         json.dumps(
@@ -267,14 +351,17 @@ if __name__ == "__main__":
                 "objective_evaluations": baseline_report["objective_evaluations"],
                 "baseline_audit_cost": baseline_report["baseline"]["audit"]["cost"],
                 "selected_audit_cost": baseline_report["selected"]["audit"]["cost"],
-                "selected_audit_safe": baseline_report["selected"]["audit"]["safe"],
+                "selected_audit_valid": baseline_report["selected"]["audit"]["valid"],
+                "selected_all_six_targets_met": baseline_report["selected"]["audit"][
+                    "all_six_targets_met"
+                ],
                 "selected_improves_baseline": baseline_report[
                     "selected_improves_baseline"
                 ],
                 "sac_audit_cost": (
                     None
-                    if baseline_report["sac_smoke_comparison"] is None
-                    else baseline_report["sac_smoke_comparison"]["audit"]["cost"]
+                    if baseline_report["sac_candidate_comparison"] is None
+                    else baseline_report["sac_candidate_comparison"]["audit"]["cost"]
                 ),
             },
             ensure_ascii=False,

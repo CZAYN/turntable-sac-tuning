@@ -1,8 +1,8 @@
-"""Server-oriented formal SAC training for the physics tuning environment.
+"""Resumable formal SAC training for the physics tuning environment.
 
-This module intentionally depends on the production environment and evaluators
-directly.  It does not import the small pipeline-check training entry point or
-consume any artifacts produced by that entry point.
+This module intentionally depends on the production environment's public API.
+It does not import the small pipeline-check training entry point or consume any
+artifacts produced by that entry point.
 """
 
 from __future__ import annotations
@@ -29,22 +29,21 @@ from stable_baselines3.common.vec_env import VecEnv
 import torch
 
 from .parallel_env import configure_thread_limits, create_training_vec_env
-from .physics_evaluator import (
-    get_physics_controller_evaluator,
-    get_physics_time_domain_evaluator,
-)
-from .tuning_env import PIDTuningEnv, STAGE_ORDER, combined_stage_cost
+from .tuning_env import PIDTuningEnv, STAGE_ORDER
 
 
 TRAINING_INPUT_RELATIVE_PATHS = (
+    "config/controller_performance_targets.json",
     "config/motor_physics.json",
     "data/processed/controller_parameter_space.json",
     "data/processed/physics_motor_ensemble.npz",
     "data/processed/physics_motor_ensemble_manifest.json",
     "src/elc_rl/__init__.py",
     "src/elc_rl/controller_parameters.py",
+    "src/elc_rl/discrete_loop_model.py",
     "src/elc_rl/evaluation_utils.py",
     "src/elc_rl/parallel_env.py",
+    "src/elc_rl/performance_targets.py",
     "src/elc_rl/physics_evaluator.py",
     "src/elc_rl/physics_motor_model.py",
     "src/elc_rl/simulation_kernel.py",
@@ -54,6 +53,7 @@ TRAINING_INPUT_RELATIVE_PATHS = (
 )
 
 PROGRESS_REPORT_INTERVAL_TIMESTEPS = 1000
+TRAINING_PROTOCOL_SCHEMA_VERSION = 3
 
 
 def utc_now() -> str:
@@ -344,7 +344,7 @@ def build_training_input_manifest(
         )
     fingerprint = hashlib.sha256(_canonical_json(files)).hexdigest()
     return {
-        "schema_version": 1,
+        "schema_version": TRAINING_PROTOCOL_SCHEMA_VERSION,
         "backend": "physics",
         "files": files,
         "fingerprint": fingerprint,
@@ -458,7 +458,7 @@ def _format_duration(seconds: float) -> str:
 
 
 class TrainingProgressReporter:
-    """Emit flush-safe progress and ETA lines for redirected server logs."""
+    """Emit flush-safe progress and ETA lines for local or redirected logs."""
 
     def __init__(
         self,
@@ -547,19 +547,6 @@ class CandidateCollectorCallback(BaseCallback):
         return not self.stop_controller.requested
 
 
-def time_report_safe(report: Mapping[str, Any]) -> bool:
-    splits = report.get("splits", {})
-    stable = bool(
-        splits
-        and all(
-            float(summary["stable_fraction"]) == 1.0
-            for summary in splits.values()
-        )
-    )
-    safety = report.get("safety")
-    return bool(stable and (safety is None or bool(safety.get("safe", False))))
-
-
 def audit_parameters(
     environment: PIDTuningEnv,
     parameters: np.ndarray,
@@ -569,28 +556,17 @@ def audit_parameters(
 ) -> dict[str, Any]:
     values = np.asarray(parameters, dtype=np.float64)
     environment.parameter_space.normalize(values)
-    frequency = environment.evaluator.audit(values)
-    time_domain = (
-        environment.time_evaluator.full_audit(values)
-        if full_time_domain
-        else environment.time_evaluator.audit(values)
+    if environment.stage != stage:
+        raise ValueError(
+            f"audit stage {stage!r} does not match environment stage "
+            f"{environment.stage!r}"
+        )
+    result = environment.audit_parameters(
+        values,
+        full_time_domain=full_time_domain,
     )
-    frequency_safe = bool(frequency["safety"]["safe"])
-    time_safe = time_report_safe(time_domain)
-    return {
-        "safe": bool(frequency_safe and time_safe),
-        "frequency_safe": frequency_safe,
-        "time_safe": time_safe,
-        "cost": combined_stage_cost(
-            frequency,
-            time_domain,
-            stage,
-            environment.position_target_hz,
-        ),
-        "parameters": values.tolist(),
-        "frequency": frequency,
-        "time_domain": time_domain,
-    }
+    result["parameters"] = values.tolist()
+    return result
 
 
 def _unique_parameter_sets(values: Iterable[np.ndarray]) -> list[np.ndarray]:
@@ -834,8 +810,9 @@ def _save_resume_checkpoint(
             with (temporary / "environment_states.pkl").open("wb") as stream:
                 cloudpickle.dump(environment_states, stream)
         metadata = {
-            "schema_version": 1,
+            "schema_version": TRAINING_PROTOCOL_SCHEMA_VERSION,
             "created_at_utc": utc_now(),
+            "stage_order": list(STAGE_ORDER),
             "stage": state["stage"],
             "stage_index": state["stage_index"],
             "stage_timesteps_completed": state["stage_timesteps_completed"],
@@ -912,6 +889,22 @@ def _load_checkpoint(
     checkpoint_metadata = json.loads(
         (checkpoint / "checkpoint.json").read_text(encoding="utf-8")
     )
+    if (
+        checkpoint_metadata.get("schema_version")
+        != TRAINING_PROTOCOL_SCHEMA_VERSION
+    ):
+        raise ValueError(
+            "checkpoint schema does not match the current four-stage "
+            "training protocol"
+        )
+    if tuple(checkpoint_metadata.get("stage_order", ())) != STAGE_ORDER:
+        raise ValueError("checkpoint stage order does not match current protocol")
+    if checkpoint_metadata.get("config_sha256") != state.get("config_sha256"):
+        raise ValueError("checkpoint configuration does not match trainer state")
+    if checkpoint_metadata.get("input_fingerprint") != state.get(
+        "input_fingerprint"
+    ):
+        raise ValueError("checkpoint input fingerprint does not match trainer state")
     checkpoint_stage_index = int(checkpoint_metadata["stage_index"])
     state_stage_index = int(state["stage_index"])
     same_stage = (
@@ -1105,7 +1098,7 @@ def _initial_state(
     initial_parameters: np.ndarray,
 ) -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": TRAINING_PROTOCOL_SCHEMA_VERSION,
         "backend": "physics",
         "status": "running",
         "run_kind": run_kind,
@@ -1114,6 +1107,7 @@ def _initial_state(
         "input_fingerprint": input_manifest["fingerprint"],
         "effective_stage_timesteps": dict(effective_steps),
         "n_envs": int(n_envs),
+        "stage_order": list(STAGE_ORDER),
         "stage_index": 0,
         "stage": STAGE_ORDER[0],
         "stage_timesteps_completed": 0,
@@ -1143,6 +1137,11 @@ def _verify_resume_state(
     effective_steps: Mapping[str, int],
     n_envs: int,
 ) -> None:
+    if state.get("schema_version") != TRAINING_PROTOCOL_SCHEMA_VERSION:
+        raise ValueError(
+            "resume state schema does not match the current four-stage "
+            "training protocol"
+        )
     expected = {
         "backend": "physics",
         "seed": int(seed),
@@ -1150,6 +1149,7 @@ def _verify_resume_state(
         "run_kind": run_kind,
         "effective_stage_timesteps": dict(effective_steps),
         "n_envs": int(n_envs),
+        "stage_order": list(STAGE_ORDER),
     }
     mismatches = {
         key: (state.get(key), value)
@@ -1256,8 +1256,18 @@ def run_formal_training(
         selected_n_envs,
     )
     input_manifest = build_training_input_manifest(root, config)
-    evaluator = get_physics_controller_evaluator(root)
-    initial_parameters = evaluator.space.initial.copy()
+    env_config = config.payload["environment"]
+    bootstrap_environment = PIDTuningEnv(
+        root,
+        stage=STAGE_ORDER[0],
+        max_episode_steps=int(env_config["max_episode_steps"]),
+        audit_interval=int(env_config["audit_interval"]),
+        initial_perturbation=0.0,
+    )
+    try:
+        initial_parameters = bootstrap_environment.parameter_space.initial.copy()
+    finally:
+        bootstrap_environment.close()
     controller = stop_controller if stop_controller is not None else StopController()
 
     if resume:
@@ -1299,7 +1309,7 @@ def run_formal_training(
             initial_parameters,
         )
         manifest = {
-            "schema_version": 1,
+            "schema_version": TRAINING_PROTOCOL_SCHEMA_VERSION,
             "backend": "physics",
             "run_kind": run_kind,
             "run_name": config.run_name,
@@ -1354,7 +1364,6 @@ def run_formal_training(
             stage_base = np.asarray(
                 state["stage_base_parameters"], dtype=np.float64
             )
-            env_config = config.payload["environment"]
             if environment is not None:
                 environment.close()
             environment = PIDTuningEnv(
@@ -1702,10 +1711,13 @@ def run_formal_training(
             training_complete=np.asarray(True),
             eligible_for_selection=np.asarray(eligible),
             input_fingerprint=np.asarray(input_manifest["fingerprint"]),
+            training_protocol_schema_version=np.asarray(
+                TRAINING_PROTOCOL_SCHEMA_VERSION, dtype=np.int64
+            ),
         )
         _atomic_write_json(output / "seed_candidate_audit.json", final_audit)
         summary = {
-            "schema_version": 1,
+            "schema_version": TRAINING_PROTOCOL_SCHEMA_VERSION,
             "backend": "physics",
             "status": "completed",
             "run_kind": run_kind,
@@ -1715,7 +1727,7 @@ def run_formal_training(
             "total_timesteps": int(model.num_timesteps),
             "effective_stage_timesteps": effective_steps,
             "candidate": candidate_path.relative_to(output).as_posix(),
-            "candidate_safe_over_all_56_models": bool(final_audit["safe"]),
+            "candidate_valid_over_training_models": bool(final_audit["safe"]),
             "candidate_joint_cost": float(final_audit["cost"]),
             "eligible_for_multi_seed_selection": eligible,
             "completed_stages": state["completed_stages"],
@@ -1788,16 +1800,16 @@ def select_multi_seed_candidate(
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"selection output directory is not empty: {output}")
     output.mkdir(parents=True, exist_ok=True)
-    evaluator = get_physics_controller_evaluator(root)
-    time_evaluator = get_physics_time_domain_evaluator(root)
+    environment = PIDTuningEnv(
+        root,
+        stage="joint",
+        initial_perturbation=0.0,
+    )
+    space = environment.parameter_space
     expected_input_fingerprint = build_training_input_manifest(
         root,
         load_formal_training_config(root),
     )["fingerprint"]
-    position_target_hz = float(
-        evaluator.space.metadata["position_design"]["target_crossover_hz"]
-    )
-
     rows: list[dict[str, Any]] = []
     for raw_path in candidate_paths:
         path = Path(raw_path).resolve()
@@ -1812,28 +1824,32 @@ def select_multi_seed_candidate(
                 np.asarray(archive["eligible_for_selection"]).item()
             )
             fingerprint = str(np.asarray(archive["input_fingerprint"]).item())
-        if parameter_names != evaluator.space.names:
+            protocol_schema = int(
+                np.asarray(
+                    archive.get("training_protocol_schema_version", -1)
+                ).item()
+            )
+        if parameter_names != space.names:
             raise ValueError(f"candidate parameter order is invalid: {path}")
-        evaluator.space.normalize(parameters)
+        space.normalize(parameters)
         if not complete or not eligible:
             raise ValueError(
                 f"candidate is not eligible for formal selection: {path}"
+            )
+        if protocol_schema != TRAINING_PROTOCOL_SCHEMA_VERSION:
+            raise ValueError(
+                f"candidate does not match current protocol: {path}"
             )
         if fingerprint != expected_input_fingerprint:
             raise ValueError(
                 f"candidate training input fingerprint does not match current protocol: {path}"
             )
-        frequency = evaluator.audit(parameters)
-        time_domain = time_evaluator.full_audit(parameters)
-        safe = bool(
-            frequency["safety"]["safe"] and time_report_safe(time_domain)
+        result = environment.audit_parameters(
+            parameters,
+            full_time_domain=True,
         )
-        cost = combined_stage_cost(
-            frequency,
-            time_domain,
-            "joint",
-            position_target_hz,
-        )
+        safe = bool(result["safe"])
+        cost = float(result["cost"])
         audit = {
             "schema_version": 1,
             "backend": "physics",
@@ -1842,10 +1858,10 @@ def select_multi_seed_candidate(
             "input_fingerprint": fingerprint,
             "safe": safe,
             "joint_cost": cost,
-            "parameter_names": list(evaluator.space.names),
+            "parameter_names": list(space.names),
             "parameters": parameters.tolist(),
-            "frequency": frequency,
-            "time_domain": time_domain,
+            "frequency": result["frequency"],
+            "time_domain": result["time_domain"],
             "hardware_use_allowed": False,
         }
         audit_path = output / "audits" / f"seed_{seed}_audit.json"
@@ -1873,7 +1889,7 @@ def select_multi_seed_candidate(
         raise ValueError("candidate runs used different training inputs")
     safe_rows = [row for row in rows if row["safe"]]
     if not safe_rows:
-        raise RuntimeError("no candidate is safe over all 56 audit models")
+        raise RuntimeError("no candidate is numerically valid over the training models")
     ranked = sorted(
         rows,
         key=lambda row: (
@@ -1887,20 +1903,24 @@ def select_multi_seed_candidate(
     final_candidate = output / "final_candidate.npz"
     _atomic_save_npz(
         final_candidate,
-        parameter_names=np.asarray(evaluator.space.names),
+        parameter_names=np.asarray(space.names),
         parameters=selected_parameters,
-        normalized_parameters=evaluator.space.normalize(selected_parameters),
+        normalized_parameters=space.normalize(selected_parameters),
         selected_seed=np.asarray(selected["seed"], dtype=np.int64),
         source_candidate_sha256=np.asarray(selected["candidate_sha256"]),
         input_fingerprint=np.asarray(selected["input_fingerprint"]),
-        safe_over_all_56_models=np.asarray(True),
+        training_protocol_schema_version=np.asarray(
+            TRAINING_PROTOCOL_SCHEMA_VERSION, dtype=np.int64
+        ),
+        valid_over_training_models=np.asarray(True),
     )
     leaderboard = {
         "schema_version": 1,
         "backend": "physics",
         "selection_policy": (
-            "hard safety over all 56 training/validation models, "
-            "then minimum joint validation cost"
+            "numerical validity over the 40 training models, then minimum "
+            "training-role joint six-metric cost; the 16 validation models "
+            "are reported separately and do not affect ranking"
         ),
         "candidate_count": len(rows),
         "safe_candidate_count": len(safe_rows),
@@ -1917,4 +1937,5 @@ def select_multi_seed_candidate(
         (output / selected["audit"]).read_text(encoding="utf-8")
     )
     _atomic_write_json(output / "final_candidate_audit.json", selected_audit)
+    environment.close()
     return leaderboard

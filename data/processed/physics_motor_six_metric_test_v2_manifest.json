@@ -1,16 +1,18 @@
 {
-  "schema_version": 2,
-  "test_suite_id": "physics_motor_final_test",
+  "schema_version": 3,
+  "test_suite_id": "physics_motor_six_metric_final_test_v2",
   "status": "sealed_unconsumed",
   "candidate_evaluated_during_construction": false,
-  "test_ensemble_path": "data/processed/physics_motor_test.npz",
-  "test_ensemble_sha256": "b725ebb7db0e397db0f1723906a8c9144e721d50210ae7fe5cf475d343f7458b",
+  "test_ensemble_path": "data/processed/physics_motor_six_metric_test_v2.npz",
+  "test_ensemble_sha256": "baafcb86488c16a61739e7582fb5780479fc9d6cd8a4458319518d6f245a5952",
   "test_spec_path": "config/final_test_spec.json",
-  "test_spec_sha256": "3969b8b1bcbd0eb3c7d6efe2cd5408a6906a67deaef0201bb2393ebd96d599a8",
-  "physics_config_sha256": "9d0528f6ca6c534ec1527fccd486fd26f4c49e28de01bdaf10775681700ff9a7",
+  "test_spec_sha256": "c7864bbb8eab0a769f12d112f743a4539f34cc564b5e27a073307ccbd0d42d61",
+  "performance_targets_path": "config/controller_performance_targets.json",
+  "performance_targets_sha256": "506be02bfa6afafa113ac7169621e499337d4afe57e6364929924cbdfdaafe4f",
+  "physics_config_sha256": "265cb7a3a58b480e51353e75bb99fe83be6f11139c478063e011e9879c05b929",
   "frozen_training_validation_ensemble_path": "data/processed/physics_motor_ensemble.npz",
-  "frozen_training_validation_ensemble_sha256": "0947c1ac67bbb23b0873a1adc72fe032aec5ec86103cbe71d7331fc3e8a48881",
-  "frozen_training_validation_manifest_sha256": "e33e7242561348b65bc39b243d74cdec6d00a04d8ed725fce077c581ae24af6f",
+  "frozen_training_validation_ensemble_sha256": "7efbdfdf0b3ead7cd9cf43b492f8a7ecfc4146c6d9dadd8c74502e646c49f617",
+  "frozen_training_validation_manifest_sha256": "db088a2376ecb77fa38ea743458364c902f75cad3690a76745f5b67dca864b06",
   "frozen_training_parameter_matrix_sha256": "92a2cc40c0322e69aaa5cfd349bba6f258988cf56f1a6212e5858e80f34239c1",
   "frozen_validation_parameter_matrix_sha256": "47a3992f104c5ac05158129ed02c5e101e4dd1e0727c3b05d74a3083469f8e2e",
   "test_parameter_matrix_sha256": "1cd02354d75c917ed99e7bea7f2671d7967d635464462fc03f8f47509621314d",
@@ -31,6 +33,14 @@
     "coulomb_friction_nm",
     "static_friction_nm"
   ],
+  "official_metrics_per_loop": [
+    "closed_loop_bandwidth_hz",
+    "gain_margin_db",
+    "phase_margin_deg",
+    "overshoot_ratio",
+    "rise_time_s",
+    "settling_time_s"
+  ],
   "model_count": 24,
   "in_distribution_models": 16,
   "ood_models": 8,
@@ -41,6 +51,6 @@
     "active_for_training_count": 0,
     "active_for_validation_count": 0,
     "final_test_only_count": 24,
-    "final_report_exists_at_seal_time": false
+    "versioned_final_report_exists_at_seal_time": false
   }
 }

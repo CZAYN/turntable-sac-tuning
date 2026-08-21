@@ -1,18 +1,20 @@
-"""Sealed final-test motor ensemble, intentionally isolated from RL training.
+"""Versioned, sealed final-test motor ensemble isolated from RL training.
 
-This module constructs and validates test-only motor parameters.  It does not
-evaluate controllers and is not imported by the Gymnasium environment.
+This module only constructs and verifies test motor parameters.  It never
+evaluates a controller and is intentionally absent from the training runtime.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from .performance_targets import load_controller_performance_targets
 from .physics_motor_model import (
     MODEL_PARAMETER_NAMES,
     load_physics_motor_config,
@@ -20,18 +22,32 @@ from .physics_motor_model import (
 )
 
 
+FINAL_TEST_SUITE_ID = "physics_motor_six_metric_final_test_v2"
 FINAL_TEST_SPEC_RELATIVE_PATH = Path("config") / "final_test_spec.json"
 FINAL_TEST_ENSEMBLE_RELATIVE_PATH = (
-    Path("data") / "processed" / "physics_motor_test.npz"
+    Path("data") / "processed" / "physics_motor_six_metric_test_v2.npz"
 )
 FINAL_TEST_MANIFEST_RELATIVE_PATH = (
-    Path("data") / "processed" / "physics_motor_test_manifest.json"
+    Path("data")
+    / "processed"
+    / "physics_motor_six_metric_test_v2_manifest.json"
+)
+PERFORMANCE_TARGETS_RELATIVE_PATH = (
+    Path("config") / "controller_performance_targets.json"
 )
 SOURCE_ENSEMBLE_RELATIVE_PATH = (
     Path("data") / "processed" / "physics_motor_ensemble.npz"
 )
 SOURCE_MANIFEST_RELATIVE_PATH = (
     Path("data") / "processed" / "physics_motor_ensemble_manifest.json"
+)
+OFFICIAL_METRICS_PER_LOOP = (
+    "closed_loop_bandwidth_hz",
+    "gain_margin_db",
+    "phase_margin_deg",
+    "overshoot_ratio",
+    "rise_time_s",
+    "settling_time_s",
 )
 
 
@@ -44,7 +60,7 @@ def _sha256(path: Path) -> str:
 
 
 def _dependency_sha256(path: Path) -> str:
-    """Hash dependencies portably while preserving byte-exact binary checks."""
+    """Hash JSON portably while preserving byte-exact binary checks."""
 
     content = path.read_bytes()
     if path.suffix.lower() == ".json":
@@ -58,16 +74,46 @@ def _matrix_sha256(values: np.ndarray) -> str:
 
 
 def load_final_test_spec(project_root: Path) -> dict[str, Any]:
-    path = Path(project_root).resolve() / FINAL_TEST_SPEC_RELATIVE_PATH
+    root = Path(project_root).resolve()
+    path = root / FINAL_TEST_SPEC_RELATIVE_PATH
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if int(payload["schema_version"]) != 1:
+    if int(payload["schema_version"]) != 2:
         raise ValueError("unsupported final-test specification schema")
-    if payload["test_suite_id"] != "physics_motor_final_test":
+    if payload["test_suite_id"] != FINAL_TEST_SUITE_ID:
         raise ValueError("unexpected final-test suite identifier")
-    if payload["isolation_policy"]["evaluate_candidate_before_training_is_locked"]:
+    isolation = payload["isolation_policy"]
+    if isolation["evaluate_candidate_before_training_is_locked"]:
         raise ValueError("final-test isolation policy must forbid pre-training evaluation")
-    if not payload["isolation_policy"]["final_report_write_once"]:
+    if not isolation["final_report_write_once"]:
         raise ValueError("final-test report must be write-once")
+    if int(payload["in_distribution_test"]["model_count"]) != 16:
+        raise ValueError("final-test specification must contain 16 ID models")
+    if int(payload["ood_test"]["model_count"]) != 8:
+        raise ValueError("final-test specification must contain 8 OOD models")
+    acceptance = payload["acceptance_policy"]
+    if tuple(acceptance["official_metrics_per_loop"]) != OFFICIAL_METRICS_PER_LOOP:
+        raise ValueError("final test must use exactly the declared six metrics")
+    if Path(acceptance["targets_source"]) != PERFORMANCE_TARGETS_RELATIVE_PATH:
+        raise ValueError("final test must share the training performance targets")
+    targets = load_controller_performance_targets(root)
+    tolerance = float(acceptance["bandwidth_reporting_tolerance_fraction"])
+    if not math.isclose(
+        tolerance,
+        targets.cost.bandwidth_relative_scale,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError(
+            "final-test bandwidth tolerance must match the six-metric cost scale"
+        )
+    output = payload["output_policy"]
+    expected_paths = {
+        "test_ensemble": FINAL_TEST_ENSEMBLE_RELATIVE_PATH,
+        "test_manifest": FINAL_TEST_MANIFEST_RELATIVE_PATH,
+    }
+    for name, expected in expected_paths.items():
+        if Path(output[name]) != expected:
+            raise ValueError(f"final-test {name} path is not the versioned path")
     return payload
 
 
@@ -92,10 +138,7 @@ def _normalized_chebyshev_distance(
     if not np.any(active):
         raise ValueError("test-set distance needs at least one uncertain parameter")
     difference = np.abs(
-        (
-            candidates[:, None, active]
-            - references[None, :, active]
-        )
+        (candidates[:, None, active] - references[None, :, active])
         / scale[None, None, active]
     )
     return np.min(np.max(difference, axis=2), axis=1)
@@ -109,10 +152,7 @@ def _minimum_internal_distance(
     if not np.any(active):
         raise ValueError("test-set distance needs at least one uncertain parameter")
     difference = np.abs(
-        (
-            candidates[:, None, active]
-            - candidates[None, :, active]
-        )
+        (candidates[:, None, active] - candidates[None, :, active])
         / scale[None, None, active]
     )
     pairwise = np.max(difference, axis=2)
@@ -121,7 +161,7 @@ def _minimum_internal_distance(
 
 
 def construct_physics_test_ensemble(project_root: Path) -> dict[str, np.ndarray]:
-    """Construct deterministic arrays in memory without exposing any candidate."""
+    """Construct deterministic arrays in memory without exposing a candidate."""
 
     root = Path(project_root).resolve()
     spec = load_final_test_spec(root)
@@ -157,7 +197,7 @@ def construct_physics_test_ensemble(project_root: Path) -> dict[str, np.ndarray]
             id_distances = distances
             break
     if id_parameters is None or id_distances is None:
-        raise RuntimeError("failed to construct a non-overlapping in-distribution test set")
+        raise RuntimeError("failed to construct a non-overlapping ID test set")
 
     ood_rows: list[np.ndarray] = []
     ood_ids: list[str] = []
@@ -177,29 +217,23 @@ def construct_physics_test_ensemble(project_root: Path) -> dict[str, np.ndarray]
         int(spec["ood_test"]["model_count"]),
         len(MODEL_PARAMETER_NAMES),
     ):
-        raise ValueError("OOD corner-model count does not match the test specification")
+        raise ValueError("OOD corner count does not match the test specification")
     ood_distances = _normalized_chebyshev_distance(
         ood_parameters, source_parameters, nominal, uncertainty
     )
 
     parameters = np.vstack([id_parameters, ood_parameters])
-    model_id = np.asarray(
-        [f"test_id_{index + 1:02d}" for index in range(id_count)] + ood_ids
-    )
-    test_group = np.asarray(
-        ["in_distribution"] * id_count + ["ood"] * len(ood_ids)
-    )
-    scenario_profile = np.asarray(
-        ["standard"] * id_count + ["ood_stress"] * len(ood_ids)
-    )
     result = {
-        "schema_version": np.asarray(2, dtype=np.int16),
+        "schema_version": np.asarray(3, dtype=np.int16),
         "test_suite_id": np.asarray(spec["test_suite_id"]),
         "parameter_names": np.asarray(MODEL_PARAMETER_NAMES),
         "parameters": parameters,
-        "model_id": model_id,
-        "test_group": test_group,
-        "scenario_profile": scenario_profile,
+        "model_id": np.asarray(
+            [f"test_id_{index + 1:02d}" for index in range(id_count)] + ood_ids
+        ),
+        "test_group": np.asarray(
+            ["in_distribution"] * id_count + ["ood"] * len(ood_ids)
+        ),
         "final_test_only": np.ones(parameters.shape[0], dtype=np.int8),
         "active_for_training": np.zeros(parameters.shape[0], dtype=np.int8),
         "active_for_validation": np.zeros(parameters.shape[0], dtype=np.int8),
@@ -208,7 +242,7 @@ def construct_physics_test_ensemble(project_root: Path) -> dict[str, np.ndarray]
         ),
         "construction_attempt": np.asarray(construction_attempt, dtype=np.int16),
     }
-    validate_physics_test_ensemble(result, source_parameters, config.nominal.as_array())
+    validate_physics_test_ensemble(result, source_parameters, nominal)
     return result
 
 
@@ -224,7 +258,6 @@ def validate_physics_test_ensemble(
         "parameters",
         "model_id",
         "test_group",
-        "scenario_profile",
         "final_test_only",
         "active_for_training",
         "active_for_validation",
@@ -234,9 +267,9 @@ def validate_physics_test_ensemble(
     missing = required.difference(ensemble)
     if missing:
         raise ValueError(f"final-test ensemble is missing arrays: {sorted(missing)}")
-    if int(ensemble["schema_version"]) != 2:
+    if int(ensemble["schema_version"]) != 3:
         raise ValueError("unexpected final-test ensemble schema")
-    if str(ensemble["test_suite_id"].item()) != "physics_motor_final_test":
+    if str(ensemble["test_suite_id"].item()) != FINAL_TEST_SUITE_ID:
         raise ValueError("unexpected final-test suite identifier")
     if tuple(ensemble["parameter_names"].tolist()) != MODEL_PARAMETER_NAMES:
         raise ValueError("final-test parameter order is invalid")
@@ -259,7 +292,7 @@ def validate_physics_test_ensemble(
     if nominal_coulomb > 0.0 and np.any(coulomb <= 0.0):
         raise ValueError("active final-test LuGre Coulomb friction must be positive")
     if np.count_nonzero(ensemble["test_group"] == "in_distribution") != 16:
-        raise ValueError("final-test suite must contain 16 in-distribution models")
+        raise ValueError("final-test suite must contain 16 ID models")
     if np.count_nonzero(ensemble["test_group"] == "ood") != 8:
         raise ValueError("final-test suite must contain 8 OOD models")
     if not np.all(ensemble["final_test_only"] == 1):
@@ -270,7 +303,7 @@ def validate_physics_test_ensemble(
         raise ValueError("final-test model leaked into validation eligibility")
     if len(set(str(value) for value in ensemble["model_id"])) != 24:
         raise ValueError("final-test model identifiers must be unique")
-    exact_overlap = np.any(
+    overlap = np.any(
         np.all(
             np.isclose(
                 parameters[:, None, :],
@@ -281,8 +314,8 @@ def validate_physics_test_ensemble(
             axis=2,
         )
     )
-    if exact_overlap:
-        raise ValueError("final-test ensemble overlaps the training/validation ensemble")
+    if overlap:
+        raise ValueError("final-test ensemble overlaps training/validation")
     nominal_overlap = np.any(
         np.all(np.isclose(parameters, nominal[None, :], rtol=0.0, atol=1e-14), axis=1)
     )
@@ -305,23 +338,29 @@ def validate_physics_test_ensemble(
     }
 
 
+def _final_output_paths(root: Path, spec: dict[str, Any]) -> tuple[Path, Path]:
+    output_policy = spec["output_policy"]
+    return (
+        root / Path(output_policy["final_report"]),
+        root / Path(output_policy["consumption_marker"]),
+    )
+
+
 def build_physics_test_ensemble(
     project_root: Path, *, overwrite: bool = False
 ) -> dict[str, Any]:
-    """Write and seal the test-only ensemble; refuse accidental rebuilds."""
+    """Write and seal the versioned suite without evaluating a controller."""
 
     root = Path(project_root).resolve()
+    spec = load_final_test_spec(root)
     output = root / FINAL_TEST_ENSEMBLE_RELATIVE_PATH
     manifest_path = root / FINAL_TEST_MANIFEST_RELATIVE_PATH
-    final_output_dir = root / "outputs" / "final_test"
-    if overwrite and (
-        (final_output_dir / "final_test_report.json").exists()
-        or (final_output_dir / "FINAL_TEST_CONSUMED.json").exists()
-    ):
-        raise PermissionError("a consumed final-test suite can never be rebuilt")
+    report_path, marker_path = _final_output_paths(root, spec)
+    if overwrite and (report_path.exists() or marker_path.exists()):
+        raise PermissionError("a consumed versioned final-test suite cannot be rebuilt")
     if (output.exists() or manifest_path.exists()) and not overwrite:
         raise FileExistsError(
-            "final-test artifacts already exist; rebuilding requires explicit overwrite=True"
+            "final-test artifacts already exist; explicit overwrite=True is required"
         )
     ensemble = construct_physics_test_ensemble(root)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -335,15 +374,19 @@ def build_physics_test_ensemble(
     train_mask = source["role"] == "train"
     validation_mask = source["role"] == "validation"
     manifest: dict[str, Any] = {
-        "schema_version": 2,
-        "test_suite_id": "physics_motor_final_test",
+        "schema_version": 3,
+        "test_suite_id": FINAL_TEST_SUITE_ID,
         "status": "sealed_unconsumed",
         "candidate_evaluated_during_construction": False,
         "test_ensemble_path": str(FINAL_TEST_ENSEMBLE_RELATIVE_PATH).replace("\\", "/"),
         "test_ensemble_sha256": _sha256(output),
         "test_spec_path": str(FINAL_TEST_SPEC_RELATIVE_PATH).replace("\\", "/"),
-        "test_spec_sha256": _dependency_sha256(
-            root / FINAL_TEST_SPEC_RELATIVE_PATH
+        "test_spec_sha256": _dependency_sha256(root / FINAL_TEST_SPEC_RELATIVE_PATH),
+        "performance_targets_path": str(PERFORMANCE_TARGETS_RELATIVE_PATH).replace(
+            "\\", "/"
+        ),
+        "performance_targets_sha256": _dependency_sha256(
+            root / PERFORMANCE_TARGETS_RELATIVE_PATH
         ),
         "physics_config_sha256": _dependency_sha256(
             root / "config" / "motor_physics.json"
@@ -364,11 +407,10 @@ def build_physics_test_ensemble(
             source_parameters[validation_mask]
         ),
         "test_parameter_matrix_sha256": _matrix_sha256(ensemble["parameters"]),
-        "in_distribution_seed": int(
-            load_final_test_spec(root)["in_distribution_test"]["seed"]
-        ),
+        "in_distribution_seed": int(spec["in_distribution_test"]["seed"]),
         "construction_attempt": int(ensemble["construction_attempt"]),
         "parameter_names": list(MODEL_PARAMETER_NAMES),
+        "official_metrics_per_loop": list(OFFICIAL_METRICS_PER_LOOP),
         **validation,
         "isolation": {
             "active_for_training_count": int(
@@ -380,9 +422,7 @@ def build_physics_test_ensemble(
             "final_test_only_count": int(
                 np.count_nonzero(ensemble["final_test_only"])
             ),
-            "final_report_exists_at_seal_time": bool(
-                (root / "outputs" / "final_test" / "final_test_report.json").exists()
-            ),
+            "versioned_final_report_exists_at_seal_time": report_path.exists(),
         },
     }
     manifest_path.write_text(
@@ -393,18 +433,23 @@ def build_physics_test_ensemble(
 
 
 def verify_physics_test_dependencies(project_root: Path) -> dict[str, Any]:
-    """Verify sealed dependencies without opening or evaluating the test ensemble."""
+    """Verify sealed dependencies without evaluating the test ensemble."""
 
     root = Path(project_root).resolve()
     output = root / FINAL_TEST_ENSEMBLE_RELATIVE_PATH
     manifest_path = root / FINAL_TEST_MANIFEST_RELATIVE_PATH
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if int(manifest["schema_version"]) != 3:
+        raise ValueError("unsupported final-test manifest schema")
+    if manifest["test_suite_id"] != FINAL_TEST_SUITE_ID:
+        raise ValueError("unexpected final-test manifest suite identifier")
     checks = {
         output: manifest["test_ensemble_sha256"],
         root / FINAL_TEST_SPEC_RELATIVE_PATH: manifest["test_spec_sha256"],
-        root / "config" / "motor_physics.json": manifest[
-            "physics_config_sha256"
+        root / PERFORMANCE_TARGETS_RELATIVE_PATH: manifest[
+            "performance_targets_sha256"
         ],
+        root / "config" / "motor_physics.json": manifest["physics_config_sha256"],
         root / SOURCE_ENSEMBLE_RELATIVE_PATH: manifest[
             "frozen_training_validation_ensemble_sha256"
         ],
@@ -423,7 +468,7 @@ def verify_physics_test_dependencies(project_root: Path) -> dict[str, Any]:
 
 
 def load_physics_test_ensemble(project_root: Path) -> dict[str, np.ndarray]:
-    """Load the sealed test set after verifying source/config hashes."""
+    """Load the sealed set after verifying every frozen dependency."""
 
     root = Path(project_root).resolve()
     output = root / FINAL_TEST_ENSEMBLE_RELATIVE_PATH

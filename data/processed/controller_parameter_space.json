@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "profile": "physics",
   "task_id": "cgs_turntable_001",
   "parameter_order": [
@@ -15,27 +15,26 @@
     "kicurr",
     "kdcurr"
   ],
-  "controller_convention": "continuous filtered PIDF: C(s)=Kp+Ki/s+Kd*s/(Tf*s+1); implemented discretely at Ts=200 us with anti-windup",
+  "controller_convention": "continuous filtered PIDF: C(s)=Kp+Ki/s+Kd*s/(Tf*s+1); implemented discretely with per-loop sample periods and anti-windup",
   "digital_conversion": {
     "Kp_d": "Kp",
     "Ki_d": "Ki*Ts",
     "Kd_d": "Kd/Ts",
-    "sample_period_s": 0.0002,
+    "sample_periods_s": {
+      "current": 2.5e-05,
+      "speed": 0.0002,
+      "position": 0.0002
+    },
     "implementation_note": "runtime uses physical continuous gains, not these display conversions"
   },
   "physics_model": {
     "model_id": "mentor_motor_physics",
     "config_relative_path": "config/motor_physics.json",
-    "config_sha256": "9d0528f6ca6c534ec1527fccd486fd26f4c49e28de01bdaf10775681700ff9a7",
+    "config_sha256": "265cb7a3a58b480e51353e75bb99fe83be6f11139c478063e011e9879c05b929",
     "primary_training_plant": true,
     "measured_frf_used_as_training_plant": false
   },
   "controller_design": {
-    "target_crossover_hz": {
-      "current": 400.0,
-      "speed": 40.0,
-      "position": 10.0
-    },
     "derivative_filter_s": {
       "current": 0.0002,
       "speed": 0.0007957747154594767,
@@ -44,12 +43,52 @@
     "derivative_ratio_at_crossover": 0.05,
     "position_integral_ratio_at_crossover": 0.2
   },
-  "position_design": {
-    "status": "physics_model_derived",
-    "target_crossover_hz": 10.0,
-    "cascade_ratio_speed_to_position": 4.0,
-    "position_sample_period_s": 0.0002,
-    "continuous_rotation": true
+  "performance_targets": {
+    "config_relative_path": "config/controller_performance_targets.json",
+    "config_sha256": "506be02bfa6afafa113ac7169621e499337d4afe57e6364929924cbdfdaafe4f",
+    "closed_loop_bandwidth_hz": {
+      "current": 1500.0,
+      "speed": 100.0,
+      "position": 20.0
+    },
+    "use": "initial_search_seed_and_direct_six_metric_evaluation",
+    "bandwidth_is_not_relabelled_as_open_loop_crossover": true
+  },
+  "initialization_heuristic": {
+    "loop_shaping_bandwidth_hz": {
+      "current": 400.0,
+      "speed": 40.0,
+      "position": 10.0
+    },
+    "sample_period_fraction_for_current": 0.08,
+    "physical_delay_fraction_for_current": 0.08,
+    "sample_period_fraction_for_speed": 0.008,
+    "sample_period_fraction_for_position": 0.002,
+    "current_to_speed_seed_ratio": 10.0,
+    "speed_to_position_seed_ratio": 4.0,
+    "evaluation_role": "none"
+  },
+  "current_pidf_feasibility_evidence": {
+    "report_path": "data/processed/current_pidf_feasibility_40khz/multirate_feasibility_report.json",
+    "report_sha256": "423e93c092c4ccfb003e9160ba630a3792a07ad8c805bd42dece948e29ceaff8",
+    "continuous_report_path": "data/processed/current_pidf_feasibility_40khz/continuous_worst_case_report.json",
+    "continuous_report_sha256": "830fa697297d2d59c92f75c6eb83f8733f6e77aa070e5958a9b31b0bb6971f58",
+    "sample_rate_hz": 40000.0,
+    "sample_period_s": 2.5e-05,
+    "candidate_selection_groups": [
+      "nominal",
+      "corners_8",
+      "dense_grid_125",
+      "training_40"
+    ],
+    "validation_used_for_candidate_selection": false,
+    "selected_current_parameters": {
+      "kpcurr": 18.592976023848415,
+      "kicurr": 2291.0460232311084,
+      "kdcurr": 0.0029121653988542578
+    },
+    "bound_margin_fraction": 0.05,
+    "role": "bounds_only_not_acceptance_or_hardware_evidence"
   },
   "dobc_design": {
     "status": "approved_simulation_structure",
@@ -62,34 +101,34 @@
       "module": "position",
       "initial": 62.13670362077854,
       "lower": 15.534175905194635,
-      "upper": 248.54681448311416,
+      "upper": 497.0936289662283,
       "transform": "log",
       "action_step_fraction": 0.06,
-      "source_kind": "mentor_physics_model_derived",
-      "source": "physics loop-shaping with the mentor motor model and fixed filtered-derivative semantics",
+      "source_kind": "performance_target_seed_derived",
+      "source": "numerical loop-shaping seed from the motor model and the real closed-loop bandwidth table; not an acceptance measurement",
       "original_value": null,
       "unit": "native_analog_gain",
       "sample_period_s": 0.0002,
       "digital_initial": 62.13670362077854,
       "training_stage": 3,
-      "hardware_status": "simulation_only_requires_measured_frf_and_hardware_validation"
+      "hardware_status": "simulation_only_requires_hil_and_hardware_validation"
     },
     {
       "name": "kipos",
       "module": "position",
       "initial": 780.8328464532966,
       "lower": 195.20821161332415,
-      "upper": 3123.3313858131864,
+      "upper": 12493.325543252746,
       "transform": "log",
       "action_step_fraction": 0.06,
-      "source_kind": "mentor_physics_model_derived",
-      "source": "physics loop-shaping with the mentor motor model and fixed filtered-derivative semantics",
+      "source_kind": "performance_target_seed_derived",
+      "source": "numerical loop-shaping seed from the motor model and the real closed-loop bandwidth table; not an acceptance measurement",
       "original_value": null,
       "unit": "native_analog_gain_per_s",
       "sample_period_s": 0.0002,
       "digital_initial": 0.15616656929065934,
       "training_stage": 3,
-      "hardware_status": "simulation_only_requires_measured_frf_and_hardware_validation"
+      "hardware_status": "simulation_only_requires_hil_and_hardware_validation"
     },
     {
       "name": "kdpos",
@@ -99,65 +138,65 @@
       "upper": 0.19778727057365952,
       "transform": "linear",
       "action_step_fraction": 0.05,
-      "source_kind": "mentor_physics_model_derived",
-      "source": "physics loop-shaping with the mentor motor model and fixed filtered-derivative semantics",
+      "source_kind": "performance_target_seed_derived",
+      "source": "numerical loop-shaping seed from the motor model and the real closed-loop bandwidth table; not an acceptance measurement",
       "original_value": null,
       "unit": "native_analog_gain_s",
       "sample_period_s": 0.0002,
       "digital_initial": 247.2340882170744,
       "training_stage": 3,
-      "hardware_status": "simulation_only_requires_measured_frf_and_hardware_validation"
+      "hardware_status": "simulation_only_requires_hil_and_hardware_validation"
     },
     {
       "name": "kpspeed",
       "module": "speed",
       "initial": 3.4056021000320973,
       "lower": 0.8514005250080243,
-      "upper": 13.62240840012839,
+      "upper": 34.280583645137426,
       "transform": "log",
       "action_step_fraction": 0.06,
-      "source_kind": "mentor_physics_model_derived",
-      "source": "physics loop-shaping with the mentor motor model and fixed filtered-derivative semantics",
+      "source_kind": "performance_target_seed_derived",
+      "source": "numerical loop-shaping seed from the motor model and the real closed-loop bandwidth table; not an acceptance measurement",
       "original_value": null,
       "unit": "native_analog_gain",
       "sample_period_s": 0.0002,
       "digital_initial": 3.4056021000320973,
       "training_stage": 2,
-      "hardware_status": "simulation_only_requires_measured_frf_and_hardware_validation"
+      "hardware_status": "simulation_only_requires_hil_and_hardware_validation"
     },
     {
       "name": "kispeed",
       "module": "speed",
       "initial": 36.5216152808872,
       "lower": 9.1304038202218,
-      "upper": 146.0864611235488,
+      "upper": 367.62435854740136,
       "transform": "log",
       "action_step_fraction": 0.06,
-      "source_kind": "mentor_physics_model_derived",
-      "source": "physics loop-shaping with the mentor motor model and fixed filtered-derivative semantics",
+      "source_kind": "performance_target_seed_derived",
+      "source": "numerical loop-shaping seed from the motor model and the real closed-loop bandwidth table; not an acceptance measurement",
       "original_value": null,
       "unit": "native_analog_gain_per_s",
       "sample_period_s": 0.0002,
       "digital_initial": 0.00730432305617744,
       "training_stage": 2,
-      "hardware_status": "simulation_only_requires_measured_frf_and_hardware_validation"
+      "hardware_status": "simulation_only_requires_hil_and_hardware_validation"
     },
     {
       "name": "kdspeed",
       "module": "speed",
       "initial": 0.0006775230105303097,
       "lower": 0.0,
-      "upper": 0.0027100920421212387,
+      "upper": 0.0027279621695994027,
       "transform": "linear",
       "action_step_fraction": 0.05,
-      "source_kind": "mentor_physics_model_derived",
-      "source": "physics loop-shaping with the mentor motor model and fixed filtered-derivative semantics",
+      "source_kind": "performance_target_seed_derived",
+      "source": "numerical loop-shaping seed from the motor model and the real closed-loop bandwidth table; not an acceptance measurement",
       "original_value": null,
       "unit": "native_analog_gain_s",
       "sample_period_s": 0.0002,
       "digital_initial": 3.3876150526515483,
       "training_stage": 2,
-      "hardware_status": "simulation_only_requires_measured_frf_and_hardware_validation"
+      "hardware_status": "simulation_only_requires_hil_and_hardware_validation"
     },
     {
       "name": "kgspeed",
@@ -173,8 +212,8 @@
       "unit": "dimensionless",
       "sample_period_s": 0.0002,
       "digital_initial": null,
-      "training_stage": 4,
-      "hardware_status": "simulation_only_requires_disturbance_validation"
+      "training_stage": 2,
+      "hardware_status": "simulation_only_speed_loop_parameter"
     },
     {
       "name": "tauspeed",
@@ -190,59 +229,59 @@
       "unit": "s",
       "sample_period_s": 0.0002,
       "digital_initial": null,
-      "training_stage": 4,
-      "hardware_status": "simulation_only_requires_disturbance_validation"
+      "training_stage": 2,
+      "hardware_status": "simulation_only_speed_loop_parameter"
     },
     {
       "name": "kpcurr",
       "module": "current",
-      "initial": 7.614564064852501,
+      "initial": 18.592976023848415,
       "lower": 1.9036410162131252,
-      "upper": 30.458256259410003,
+      "upper": 217.75640901225015,
       "transform": "log",
       "action_step_fraction": 0.06,
-      "source_kind": "mentor_physics_model_derived",
-      "source": "physics loop-shaping with the mentor motor model and fixed filtered-derivative semantics",
+      "source_kind": "non_training_feasibility_candidate_derived",
+      "source": "numerical loop-shaping seed from the motor model and the real closed-loop bandwidth table; not an acceptance measurement; current-loop bounds minimally cover the validated non-training feasibility candidate with 5 percent margin",
       "original_value": null,
       "unit": "native_analog_gain",
-      "sample_period_s": 0.0002,
-      "digital_initial": 7.614564064852501,
+      "sample_period_s": 2.5e-05,
+      "digital_initial": 18.592976023848415,
       "training_stage": 1,
-      "hardware_status": "simulation_only_requires_measured_frf_and_hardware_validation"
+      "hardware_status": "simulation_only_requires_hil_and_hardware_validation"
     },
     {
       "name": "kicurr",
       "module": "current",
-      "initial": 14044.89042327615,
-      "lower": 3511.2226058190377,
-      "upper": 56179.5616931046,
+      "initial": 2291.0460232311084,
+      "lower": 2181.9485935534367,
+      "upper": 401646.7492420261,
       "transform": "log",
       "action_step_fraction": 0.06,
-      "source_kind": "mentor_physics_model_derived",
-      "source": "physics loop-shaping with the mentor motor model and fixed filtered-derivative semantics",
+      "source_kind": "non_training_feasibility_candidate_derived",
+      "source": "numerical loop-shaping seed from the motor model and the real closed-loop bandwidth table; not an acceptance measurement; current-loop bounds minimally cover the validated non-training feasibility candidate with 5 percent margin",
       "original_value": null,
       "unit": "native_analog_gain_per_s",
-      "sample_period_s": 0.0002,
-      "digital_initial": 2.80897808465523,
+      "sample_period_s": 2.5e-05,
+      "digital_initial": 0.057276150580777715,
       "training_stage": 1,
-      "hardware_status": "simulation_only_requires_measured_frf_and_hardware_validation"
+      "hardware_status": "simulation_only_requires_hil_and_hardware_validation"
     },
     {
       "name": "kdcurr",
       "module": "current",
-      "initial": 0.0001514869388013989,
+      "initial": 0.0029121653988542578,
       "lower": 0.0,
-      "upper": 0.0006059477552055956,
+      "upper": 0.0030577736687969707,
       "transform": "linear",
       "action_step_fraction": 0.05,
-      "source_kind": "mentor_physics_model_derived",
-      "source": "physics loop-shaping with the mentor motor model and fixed filtered-derivative semantics",
+      "source_kind": "non_training_feasibility_candidate_derived",
+      "source": "numerical loop-shaping seed from the motor model and the real closed-loop bandwidth table; not an acceptance measurement; current-loop bounds minimally cover the validated non-training feasibility candidate with 5 percent margin",
       "original_value": null,
       "unit": "native_analog_gain_s",
-      "sample_period_s": 0.0002,
-      "digital_initial": 0.7574346940069944,
+      "sample_period_s": 2.5e-05,
+      "digital_initial": 116.4866159541703,
       "training_stage": 1,
-      "hardware_status": "simulation_only_requires_measured_frf_and_hardware_validation"
+      "hardware_status": "simulation_only_requires_hil_and_hardware_validation"
     }
   ],
   "safety_policy": {
@@ -251,7 +290,6 @@
     "required_before_hardware": [
       "confirm voltage/current/speed limits against drive and motor ratings",
       "confirm encoder resolution and feedback filtering",
-      "compare physics FRFs with all measured three-loop FRFs",
       "validate candidates in HIL and bounded low-energy tests"
     ]
   }

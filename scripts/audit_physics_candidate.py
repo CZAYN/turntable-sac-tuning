@@ -35,21 +35,16 @@ if __name__ == "__main__":
     time_domain = time_evaluator.full_audit(parameters, include_models=True)
     safe = bool(frequency["safety"]["safe"] and time_domain["safety"]["safe"])
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "backend": "physics",
         "candidate": str(candidate_path),
         "parameter_names": list(frequency_evaluator.space.names),
         "parameters": parameters.tolist(),
-        "safe_over_all_56_models": safe,
+        "valid_over_training_models": safe,
         "joint_cost": combined_stage_cost(
             frequency,
             time_domain,
             "joint",
-            float(
-                frequency_evaluator.space.metadata["position_design"][
-                    "target_crossover_hz"
-                ]
-            ),
         ),
         "frequency": frequency,
         "time_domain": time_domain,
@@ -66,7 +61,7 @@ if __name__ == "__main__":
     print(
         json.dumps(
             {
-                "safe_over_all_56_models": safe,
+                "valid_over_training_models": safe,
                 "joint_cost": report["joint_cost"],
                 "frequency_models": frequency["evaluated_model_count"],
                 "time_domain_models": time_domain["evaluated_model_count"],

@@ -1,130 +1,61 @@
-# CGS 转台强化学习调参
+# CGS 转台三环 SAC 调参
 
-本项目使用分阶段 SAC，为 CGS 转台三环 PIDF 与 DOBC 控制器调节 11 个参数。当前实现以物理模型为训练环境，奖励同时包含频域和时域指标，并保留独立的训练、验证与最终测试数据。
+本项目使用 Soft Actor-Critic（SAC）在电机数学物理模型上联合调节三环 PIDF 与速度环 DOBC，共 11 个控制参数。当前正式协议只评价用户提供的六类控制性能指标：闭环带宽、增益裕度、相位裕度、超调、上升时间和调节时间。频域评价已经改为与时域内核一致的多采样率离散小信号状态空间：电流环 40 kHz，速度环、位置环与 DOBC 5 kHz，不再使用独立的连续域控制代理。
 
-实测三环频响只用于训练之外的离线模型误差诊断，不进入 SAC observation、Reward、Replay Buffer、候选选择或服务器运行包。
-
-时域内核已经实现完整 LuGre 摩擦、稳定的内部状态离散更新和摩擦诊断轨迹。当前仿真配置已启用 LuGre，并暂用 `τc=0.015 N·m`、`τs=0.020 N·m` 作为启动假设，二者按 `±10%` 进入训练与验证模型采样。这些数值以及现有 `σ0、σ1、ωs` 均未经过实机辨识，只允许用于仿真启动和训练验证，不能作为硬件参数结论。
-
-仓库只维护一个当前版本。配置、数据和输出路径不使用 `v1`、`v2` 等版本后缀；历史状态由 Git 管理。
+当前工作入口是 Windows 本机环境 `D:\OtherSoftware\elc_RL`。本轮只完成多采样率离散模型统一、40 kHz电流环非训练可行性扫描、依赖检查、自动化测试、环境快速检查和极短工程链路检查，**不启动正式训练或最终测试**。
 
 ## 文档导航
 
-- [项目完整流程](PROJECT_WORKFLOW.md)：控制结构、数据与物理模型、SAC 训练、候选选择、最终测试及第一轮正式实验记录。
-- [LuGre 参数辨识与启用](docs/LUGRE_IDENTIFICATION.md)：所需实验数据、参数关系、配置切换和重建检查。
-- [服务器正式训练](SERVER_TRAINING.md)：环境、预检、并行训练、checkpoint 和候选选择操作。
-- [服务器发布与最终测试](SERVER_RELEASE.md)：发布包、候选锁定和一次性最终测试操作。
+- [项目流程](PROJECT_WORKFLOW.md)：唯一六指标目标、四阶段环境、observation、SAC 网络、Reward、数据隔离与兼容边界。
+- [本机环境与训练前检查](LOCAL_SETUP.md)：使用 `D:\OtherSoftware\elc_RL` 完成安装和训练前验证。
+- [LuGre 参数辨识](docs/LUGRE_IDENTIFICATION.md)：当前临时摩擦参数的适用边界与未来实机辨识要求。
 
-## 性能结构
+`SERVER_TRAINING.md` 和 `SERVER_RELEASE.md` 仅保留为历史服务器操作记录，不是当前协议的执行入口。
 
-- 时域物理仿真由 Numba 编译为 `float64` 数值内核。
-- 每个随机种子默认使用 4 个独立子进程环境。
-- 默认同时启动 3 个随机种子，共使用约 12 个 CPU 核心。
-- SAC 的梯度更新数随环境数等比例增加，保持每条 transition 的更新比不变。
-- checkpoint 保存模型、Replay Buffer、全局随机状态和每个环境的完整状态，可精确续训。
+## 唯一性能目标
 
-并行化只改变采样和执行方式，不改变控制器结构、物理方程、奖励定义、训练阶段、训练步数或最终验收标准。
+| 环路 | 闭环带宽 | 最小增益裕度 | 最小相位裕度 | 最大超调 | 最大上升时间 | 最大调节时间 |
+|---|---:|---:|---:|---:|---:|---:|
+| 电流环 | 1500 Hz | 5 dB | 65° | 20% | 0.05 s | 0.1 s |
+| 速度环 PIDF + DOBC | 100 Hz | 5 dB | 65° | 50% | 0.5 s | 1 s |
+| 位置环 | 20 Hz | 2 dB | 70° | 20% | 0.5 s | 1 s |
 
-## 环境
+闭环带宽是需要逼近的双向目标；两个裕度是下限；超调、上升时间和调节时间是上限。DOBC 没有独立 Cost，它的两个参数与速度 PIDF 三个参数共同依据速度环六项指标调整。
 
-服务器环境：
+## 当前训练协议
 
-- Python 3.11
-- PyTorch 2.5.1 + CUDA 12.1
-- Stable-Baselines3 2.9.0
-- Gymnasium 1.2.3
-- Numba 0.66.0
+- 四阶段：`current → speed → position → joint`。
+- 11 维连续动作：9 个 PIDF 参数和 2 个 DOBC 参数。
+- 146 维纯物理 observation：96 维物理模型频响上下文、6 维摩擦上下文、11 维参数状态、18 维归一化性能误差、11 维动作掩码和4维阶段标识。
+- Actor：两层 `256 × 256`；双 Critic：各两层 `256 × 256`。
+- 有效候选的单步奖励：
 
-```bash
-unset PYTHONPATH
-source /data/l50063953/miniconda3/etc/profile.d/conda.sh
-conda env create -f environment-server.yml
-conda activate elc-rl-server
-python -m pip install --no-deps --no-build-isolation -e .
-python scripts/check_server_runtime.py --device cuda
+  \[
+  r_t=10\left(C_{t-1}-C_t\right)-0.02C_t
+  \]
+
+- 数值无效、闭环发散或仿真终止时奖励为 `-100` 并终止 episode。
+
+训练阶段只从40个训练物理模型中抽样。16个验证模型独立报告六指标泛化与有效性，不混入在线 Reward 或训练模型聚合 Cost。隔离的24个最终测试模型必须按新协议重新生成和封存后才能使用。
+
+## 训练前快速检查
+
+在 PowerShell 中执行：
+
+```powershell
+$ElcPython = "D:\OtherSoftware\elc_RL\python.exe"
+
+& $ElcPython -m pip install --no-deps --no-build-isolation -e .
+& $ElcPython -m pip check
+& $ElcPython -m pytest -q
+& $ElcPython scripts/check_tuning_env.py --quick
+& $ElcPython scripts/benchmark_parallel_env.py --n-envs 2 --steps-per-env 64
 ```
 
-## 本机验证
+这些命令只执行安装、测试、环境交互检查和不含 SAC 梯度更新的仿真基准，不会启动训练。详细说明见 [LOCAL_SETUP.md](LOCAL_SETUP.md)。
 
-```bash
-python -m pytest -q
-python scripts/check_tuning_env.py --quick
-python scripts/benchmark_parallel_env.py --n-envs 4 --steps-per-env 64
-python scripts/train_sac.py \
-  --seed 20260801 \
-  --device cpu \
-  --n-envs 4 \
-  --engineering-check-steps-per-stage 4 \
-  --output-dir outputs/engineering_check
-```
+## 兼容边界
 
-工程检查输出不能参与正式候选选择。
+本次修改改变了性能目标、Cost、Reward、训练阶段、observation 结构、频域动力学和最终测试报告结构，训练协议版本已升级。因此此前生成的模型、Replay Buffer、checkpoint、候选参数、排行榜及最终测试消费记录均不可恢复或复用；必须使用新的输出目录开启一次全新实验。
 
-同时检查三个种子的并行启动器：
-
-```bash
-python -u scripts/train_all_seeds.py \
-  --device cpu \
-  --n-envs 4 \
-  --parallel-seeds 3 \
-  --engineering-check-steps-per-stage 4
-```
-
-该命令默认写入 `outputs/sac_training_engineering_check/`，不会混入正式训练目录。
-
-## 正式训练
-
-按配置同时启动全部种子：
-
-```bash
-python -u scripts/train_all_seeds.py --device cuda
-```
-
-默认并行度来自 `config/sac_training.json`：
-
-```text
-3 个并行种子 × 每种子 4 个环境 = 12 个环境进程
-```
-
-需要降低服务器负载时可以覆盖并行度：
-
-```bash
-python -u scripts/train_all_seeds.py \
-  --device cuda \
-  --parallel-seeds 2 \
-  --n-envs 2
-```
-
-单独运行一个种子：
-
-```bash
-python -u scripts/train_sac.py --seed 20260801 --device cuda --n-envs 4
-```
-
-输出位置：
-
-```text
-outputs/sac_training/seed_<seed>/
-logs/sac_training/seed_<seed>.log
-logs/sac_training/launcher_state.json
-```
-
-## 中断与续训
-
-正常终止信号会触发可恢复 checkpoint。恢复时必须使用相同源码、配置、训练数据和环境数：
-
-```bash
-python -u scripts/train_all_seeds.py --device cuda --resume
-```
-
-如果输入指纹或环境数变化，程序会拒绝续训；此时应开启全新的实验目录。
-
-## 候选与最终测试
-
-三个正式种子全部完成后：
-
-```bash
-python scripts/select_final_candidate.py
-```
-
-训练和候选选择只使用 40 个训练模型与 16 个验证模型。唯一候选锁定后，才允许使用隔离的 24 个独立最终测试模型。完整实验逻辑见 [项目完整流程](PROJECT_WORKFLOW.md)，详细服务器操作见 [服务器正式训练](SERVER_TRAINING.md) 和 [服务器发布与最终测试](SERVER_RELEASE.md)。
+实测频响目前只作为训练之外的模型误差诊断，不进入 observation、Reward 或 Replay Buffer。LuGre 当前仍含未经实机辨识的临时仿真参数，任何仿真候选都不能直接宣称为实机最优参数。

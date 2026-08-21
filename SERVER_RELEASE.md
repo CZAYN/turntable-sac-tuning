@@ -1,4 +1,6 @@
-# CGS 转台单次上传服务器流程
+# CGS 转台单次上传服务器流程（Legacy）
+
+> **历史文档，不是当前发布流程。** 本文对应旧训练与旧封存最终测试结构。当前六指标协议改变了配置、observation、Reward、阶段、参数空间和最终测试 schema；旧发布包、候选锁与消费记录均不兼容。重新启用服务器前必须重新生成发布包与封存测试清单。
 
 发布包只需上传一次，内部包含两个相互隔离的 ZIP：
 
@@ -108,7 +110,7 @@ python scripts/run_final_test.py \
 最终输出：
 
 ```text
-outputs/final_test/
+outputs/final_test_v2/
 ├── final_test_report.json
 └── FINAL_TEST_CONSUMED.json
 ```

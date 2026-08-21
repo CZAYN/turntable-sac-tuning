@@ -1,8 +1,8 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "model_id": "mentor_motor_physics",
   "config_path": "config/motor_physics.json",
-  "config_sha256": "9d0528f6ca6c534ec1527fccd486fd26f4c49e28de01bdaf10775681700ff9a7",
+  "config_sha256": "265cb7a3a58b480e51353e75bb99fe83be6f11139c478063e011e9879c05b929",
   "ensemble_path": "data/processed/physics_motor_ensemble.npz",
   "model_count": 56,
   "training_models": 40,
@@ -23,6 +23,16 @@
     "coulomb_friction_nm",
     "static_friction_nm"
   ],
+  "sample_periods_s": {
+    "current": 2.5e-05,
+    "speed": 0.0002,
+    "position": 0.0002
+  },
+  "controller_update_ratios": {
+    "current": 1,
+    "speed": 8,
+    "position": 8
+  },
   "uncertainty_fraction": {
     "inductance_h": 0.05,
     "resistance_ohm": 0.05,

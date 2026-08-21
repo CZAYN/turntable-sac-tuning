@@ -16,269 +16,137 @@ from .physics_evaluator import (
 )
 
 
-STAGE_ORDER = ("current", "speed", "position", "dobc", "joint")
+STAGE_ORDER = ("current", "speed", "position", "joint")
 STAGE_INDICES = {
     "current": (8, 9, 10),
-    "speed": (3, 4, 5),
+    "speed": (3, 4, 5, 6, 7),
     "position": (0, 1, 2),
-    "dobc": (6, 7),
     "joint": tuple(range(11)),
 }
-CORE_SPLITS = (
-    "current_reference",
-    "speed_train",
-    "position_surrogate",
+LOOP_ORDER = ("current", "speed", "position")
+PER_LOOP_PERFORMANCE_METRIC_NAMES = (
+    "bandwidth",
+    "gain_margin",
+    "phase_margin",
+    "overshoot",
+    "rise_time",
+    "settling_time",
 )
-PER_LOOP_METRIC_NAMES = (
-    "crossover_log_ratio",
-    "phase_margin_norm",
-    "gain_margin_norm",
-    "bandwidth_log_ratio",
-    "sensitivity_peak_norm",
-    "stable_fraction",
-)
-METRIC_NAMES = tuple(
-    f"{split}:{metric}"
-    for split in CORE_SPLITS
-    for metric in PER_LOOP_METRIC_NAMES
-) + (
-    "current_to_speed_ratio_norm",
-    "speed_to_position_ratio_norm",
-    "dobc_residual_rms",
-    "dobc_aggressiveness",
-    "total_cost_squashed",
-)
-TIME_TARGETS_S = {
-    "current_reference": 0.005,
-    "speed_train": 0.050,
-    "position_surrogate": 0.300,
-}
-TIME_PER_LOOP_METRIC_NAMES = (
-    "rise_time_normalized",
-    "settling_time_normalized",
-    "overshoot_normalized",
-    "steady_state_error_normalized",
-    "iae_ratio_to_baseline",
-    "control_peak_ratio_to_soft_limit",
-    "control_slew_ratio_to_soft_limit",
-    "stable_fraction",
-)
-TIME_METRIC_NAMES = tuple(
-    f"{split}:{metric}"
-    for split in CORE_SPLITS
-    for metric in TIME_PER_LOOP_METRIC_NAMES
-) + (
-    "speed_train:disturbance_peak_ratio_to_baseline",
-    "speed_train:disturbance_iae_ratio_to_baseline",
-    "speed_train:disturbance_recovery_time_normalized",
+PERFORMANCE_METRIC_NAMES = tuple(
+    f"{loop}:{metric}"
+    for loop in LOOP_ORDER
+    for metric in PER_LOOP_PERFORMANCE_METRIC_NAMES
 )
 OBSERVATION_KEYS = (
     "sampled_frf",
     "friction_context",
     "parameter_state",
-    "metrics",
-    "time_metrics",
+    "performance_metrics",
     "action_mask",
     "stage",
 )
 
 
-def _metric_vector(report: dict[str, Any], position_target_hz: float) -> np.ndarray:
-    del position_target_hz
-    targets = report["targets_hz"]
+def _performance_metric_vector(
+    frequency_report: dict[str, Any],
+    time_report: dict[str, Any],
+) -> np.ndarray:
+    """Return the 18 normalized errors used by the SAC observation."""
+
     values: list[float] = []
-    for split in CORE_SPLITS:
-        summary = report["splits"][split]
-        target = targets[split]
+    for loop in LOOP_ORDER:
+        frequency_errors = frequency_report["performance_metrics"][loop][
+            "normalized_errors"
+        ]
+        time_errors = time_report["performance_metrics"][loop][
+            "normalized_errors"
+        ]
         values.extend(
             [
-                float(np.log(float(summary["crossover_hz_median"]) / target)),
-                float(summary["phase_margin_deg_worst"]) / 180.0,
-                float(summary["gain_margin_db_worst"]) / 120.0,
-                float(np.log(float(summary["bandwidth_hz_median"]) / target)),
-                float(summary["sensitivity_peak_worst"]) / 2.5,
-                float(summary["stable_fraction"]),
+                float(frequency_errors["bandwidth"]),
+                float(frequency_errors["gain_margin"]),
+                float(frequency_errors["phase_margin"]),
+                float(time_errors["overshoot"]),
+                float(time_errors["rise_time"]),
+                float(time_errors["settling_time"]),
             ]
         )
-    safety = report["safety"]
-    values.extend(
-        [
-            float(safety["current_to_speed_crossover_ratio"]) / 4.0,
-            float(safety["speed_to_position_crossover_ratio"]) / 3.0,
-            float(report["dobc"]["ideal_0p1_to_10hz_residual_rms"]),
-            float(report["dobc"]["aggressiveness_proxy"]),
-            float(np.tanh(float(report["cost"]["total"]) / 10.0)),
-        ]
-    )
     vector = np.asarray(values, dtype=np.float32)
-    if vector.shape != (len(METRIC_NAMES),) or not np.isfinite(vector).all():
-        raise ValueError("environment metric vector is invalid")
-    return np.clip(vector, -5.0, 5.0)
-
-
-def _time_metric_vector(report: dict[str, Any]) -> np.ndarray:
-    values: list[float] = []
-    for split in CORE_SPLITS:
-        summary = report["splits"][split]
-        target_s = TIME_TARGETS_S[split]
-        values.extend(
-            [
-                float(summary["rise_time_s_median"]) / target_s,
-                float(summary["settling_time_s_worst"]) / target_s,
-                float(summary["overshoot_ratio_worst"]) / 0.10,
-                float(summary["steady_state_error_worst"]) / 0.02,
-                float(summary["iae_ratio_to_baseline_median"]),
-                float(summary["control_peak_ratio_to_baseline_worst"]) / 1.25,
-                float(summary["control_slew_ratio_to_baseline_worst"]) / 1.50,
-                float(summary["stable_fraction"]),
-            ]
-        )
-    speed = report["splits"]["speed_train"]
-    values.extend(
-        [
-            float(speed["disturbance_peak_ratio_to_baseline_worst"]),
-            float(speed["disturbance_iae_ratio_to_baseline_median"]),
-            float(speed["disturbance_recovery_time_s_worst"]) / 0.050,
-        ]
-    )
-    vector = np.asarray(values, dtype=np.float32)
-    if vector.shape != (len(TIME_METRIC_NAMES),) or not np.isfinite(vector).all():
-        raise ValueError("environment time-domain metric vector is invalid")
-    return np.clip(vector, -5.0, 5.0)
-
-
-def _loop_stage_cost(summary: dict[str, float | int], target_hz: float) -> float:
-    crossover = float(summary["crossover_hz_median"])
-    phase_margin = float(summary["phase_margin_deg_worst"])
-    gain_margin = float(summary["gain_margin_db_worst"])
-    sensitivity_peak = float(summary["sensitivity_peak_worst"])
-    stable_fraction = float(summary["stable_fraction"])
-    return float(
-        abs(np.log(crossover / target_hz))
-        + 2.0 * max(0.0, 55.0 - phase_margin) / 55.0
-        + max(0.0, 6.0 - gain_margin) / 6.0
-        + max(0.0, sensitivity_peak - 1.5)
-        + 100.0 * (1.0 - stable_fraction)
+    if vector.shape != (len(PERFORMANCE_METRIC_NAMES),):
+        raise ValueError("environment performance metric vector has invalid shape")
+    return np.clip(
+        np.nan_to_num(vector, nan=5.0, posinf=5.0, neginf=-5.0),
+        -5.0,
+        5.0,
     )
 
 
-def stage_cost(report: dict[str, Any], stage: str, position_target_hz: float) -> float:
-    """Return the stage-specific scalar optimized by the environment reward."""
+def _loop_domain_cost(report: dict[str, Any], loop: str, domain: str) -> float:
+    metric = report["performance_metrics"][loop]
+    explicit_name = f"{domain}_cost"
+    if explicit_name in metric:
+        value = float(metric[explicit_name])
+    else:
+        value = float(report["cost"]["loops"][loop])
+    if not np.isfinite(value):
+        return 100.0
+    return value
 
-    del position_target_hz
+
+def _aggregate_stage_cost(loop_costs: dict[str, float], stage: str) -> float:
     if stage == "joint":
-        return float(report["cost"]["total"])
-    if stage == "dobc":
-        return float(report["cost"]["dobc_idealized"] + report["cost"]["unsafe"])
-    targets = report["targets_hz"]
-    split_and_target = {
-        "current": ("current_reference", float(targets["current_reference"])),
-        "speed": ("speed_train", float(targets["speed_train"])),
-        "position": ("position_surrogate", float(targets["position_surrogate"])),
+        values = np.asarray([loop_costs[loop] for loop in LOOP_ORDER])
+        return float(np.mean(values) + 0.5 * np.max(values))
+    return float(loop_costs[stage])
+
+
+def stage_cost(report: dict[str, Any], stage: str) -> float:
+    """Return the table-only frequency-domain stage cost."""
+
+    loop_costs = {
+        loop: _loop_domain_cost(report, loop, "frequency")
+        for loop in LOOP_ORDER
     }
-    split, target = split_and_target[stage]
-    cost = _loop_stage_cost(report["splits"][split], target)
-    safety = report["safety"]
-    if stage in {"current", "speed"}:
-        cost += max(
-            0.0, 4.0 - float(safety["current_to_speed_crossover_ratio"])
-        ) / 4.0
-    if stage in {"speed", "position"}:
-        cost += max(
-            0.0, 3.0 - float(safety["speed_to_position_crossover_ratio"])
-        ) / 3.0
-    return float(cost)
-
-
-def _time_loop_cost(summary: dict[str, float | int], target_s: float) -> float:
-    """Soft time-domain cost without inventing absolute actuator limits."""
-
-    settling_ratio = float(summary["settling_time_s_worst"]) / target_s
-    overshoot_ratio = float(summary["overshoot_ratio_worst"]) / 0.10
-    steady_state_ratio = float(summary["steady_state_error_worst"]) / 0.02
-    iae_ratio = float(summary["iae_ratio_to_baseline_median"])
-    control_peak_ratio = float(summary["control_peak_ratio_to_baseline_worst"])
-    control_rms_ratio = float(summary["control_rms_ratio_to_baseline_worst"])
-    control_slew_ratio = float(summary["control_slew_ratio_to_baseline_worst"])
-    stable_fraction = float(summary["stable_fraction"])
-    return float(
-        100.0 * (1.0 - stable_fraction)
-        + 0.5 * max(0.0, settling_ratio - 1.0)
-        + 2.0 * max(0.0, overshoot_ratio - 1.0)
-        + max(0.0, steady_state_ratio - 1.0)
-        + 0.25 * iae_ratio
-        + max(0.0, control_peak_ratio - 1.25)
-        + 0.5 * max(0.0, control_rms_ratio - 1.25)
-        + 0.5 * max(0.0, control_slew_ratio - 1.50)
-    )
+    return _aggregate_stage_cost(loop_costs, stage)
 
 
 def time_stage_cost(report: dict[str, Any], stage: str) -> float:
-    """Return the stage-specific step/disturbance cost."""
+    """Return the table-only time-domain stage cost."""
 
     loop_costs = {
-        "current": _time_loop_cost(
-            report["splits"]["current_reference"],
-            TIME_TARGETS_S["current_reference"],
-        ),
-        "speed": _time_loop_cost(
-            report["splits"]["speed_train"],
-            TIME_TARGETS_S["speed_train"],
-        ),
-        "position": _time_loop_cost(
-            report["splits"]["position_surrogate"],
-            TIME_TARGETS_S["position_surrogate"],
-        ),
+        loop: _loop_domain_cost(report, loop, "time") for loop in LOOP_ORDER
     }
-    speed = report["splits"]["speed_train"]
-    dobc_cost = float(
-        1.5 * float(speed["disturbance_peak_ratio_to_baseline_worst"])
-        + float(speed["disturbance_iae_ratio_to_baseline_median"])
-        + 0.5
-        * max(
-            0.0,
-            float(speed["disturbance_recovery_time_s_worst"]) / 0.050 - 1.0,
-        )
-    )
-    if stage == "dobc":
-        return dobc_cost
-    if stage == "joint":
-        return float(sum(loop_costs.values()) + dobc_cost)
-    return float(loop_costs[stage])
+    return _aggregate_stage_cost(loop_costs, stage)
 
 
 def combined_stage_cost(
     frequency_report: dict[str, Any],
     time_report: dict[str, Any],
     stage: str,
-    position_target_hz: float,
 ) -> float:
-    """Combined frequency/time-domain objective used by combined frequency/time-domain reward."""
+    """Combine the six table metrics, with equal domain weight per loop."""
 
-    return float(
-        stage_cost(frequency_report, stage, position_target_hz)
-        + time_stage_cost(time_report, stage)
-    )
+    loop_costs = {
+        loop: 0.5 * _loop_domain_cost(frequency_report, loop, "frequency")
+        + 0.5 * _loop_domain_cost(time_report, loop, "time")
+        for loop in LOOP_ORDER
+    }
+    return _aggregate_stage_cost(loop_costs, stage)
 
 
-def _time_report_safe(report: dict[str, Any]) -> bool:
-    """Apply physical-limit safety when supplied, otherwise require stability."""
+def _report_valid(report: dict[str, Any]) -> bool:
+    """Return numerical/dynamical validity, not whether targets are met."""
 
-    stable = bool(
-        report["splits"]
-        and all(
-            float(summary["stable_fraction"]) == 1.0
-            for summary in report["splits"].values()
-        )
+    performance = report.get("performance_metrics", {})
+    metrics_valid = bool(
+        performance
+        and all(bool(performance.get(loop, {}).get("valid", False)) for loop in LOOP_ORDER)
     )
     declared_safety = report.get("safety")
-    return bool(
-        stable
-        and (
-            declared_safety is None
-            or bool(declared_safety.get("safe", False))
-        )
+    safety_valid = bool(
+        declared_safety is None or declared_safety.get("safe", False)
     )
+    return bool(metrics_valid and safety_valid)
 
 
 class PIDTuningEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
@@ -329,9 +197,6 @@ class PIDTuningEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
                 raise ValueError("base_parameters must have shape (11,)")
             self.parameter_space.normalize(candidate_base)
             self._base_parameters = candidate_base.copy()
-        self.position_target_hz = float(
-            self.parameter_space.metadata["position_design"]["target_crossover_hz"]
-        )
         self._action_mask = np.zeros(11, dtype=np.float32)
         self._action_mask[list(STAGE_INDICES[stage])] = 1.0
         self._stage_vector = np.zeros(len(STAGE_ORDER), dtype=np.float32)
@@ -349,16 +214,10 @@ class PIDTuningEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
                 "parameter_state": spaces.Box(
                     -1.0, 1.0, shape=(11,), dtype=np.float32
                 ),
-                "metrics": spaces.Box(
+                "performance_metrics": spaces.Box(
                     -5.0,
                     5.0,
-                    shape=(len(METRIC_NAMES),),
-                    dtype=np.float32,
-                ),
-                "time_metrics": spaces.Box(
-                    -5.0,
-                    5.0,
-                    shape=(len(TIME_METRIC_NAMES),),
+                    shape=(len(PERFORMANCE_METRIC_NAMES),),
                     dtype=np.float32,
                 ),
                 "action_mask": spaces.Box(
@@ -400,6 +259,36 @@ class PIDTuningEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
     def action_mask(self) -> np.ndarray:
         return self._action_mask.copy()
 
+    def audit_parameters(
+        self,
+        parameters: np.ndarray,
+        *,
+        full_time_domain: bool = False,
+    ) -> dict[str, Any]:
+        """Evaluate a candidate through the same six-metric objective as training."""
+
+        candidate = np.asarray(parameters, dtype=np.float64)
+        if candidate.shape != (11,):
+            raise ValueError("parameters must have shape (11,)")
+        self.parameter_space.normalize(candidate)
+        frequency_report = self.evaluator.audit(candidate)
+        time_report = (
+            self.time_evaluator.full_audit(candidate)
+            if full_time_domain
+            else self.time_evaluator.audit(candidate)
+        )
+        valid = bool(
+            _report_valid(frequency_report) and _report_valid(time_report)
+        )
+        return {
+            "safe": valid,
+            "valid": valid,
+            "cost": combined_stage_cost(frequency_report, time_report, self.stage),
+            "frequency": frequency_report,
+            "time_domain": time_report,
+            "parameters": candidate.copy(),
+        }
+
     def _observation(self) -> dict[str, np.ndarray]:
         if (
             self._parameters is None
@@ -415,8 +304,9 @@ class PIDTuningEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             "parameter_state": self.parameter_space.normalize(self._parameters).astype(
                 np.float32
             ),
-            "metrics": _metric_vector(self._report, self.position_target_hz),
-            "time_metrics": _time_metric_vector(self._time_report),
+            "performance_metrics": _performance_metric_vector(
+                self._report, self._time_report
+            ),
             "action_mask": self._action_mask.copy(),
             "stage": self._stage_vector.copy(),
         }
@@ -432,42 +322,61 @@ class PIDTuningEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             or self._parameters is None
         ):
             raise RuntimeError("environment state is not initialized")
-        audit_frequency_safe = (
+        audit_frequency_valid = (
             None
             if self._last_audit_report is None
-            else bool(self._last_audit_report["safety"]["safe"])
+            else _report_valid(self._last_audit_report)
         )
-        audit_time_safe = (
+        audit_time_valid = (
             None
             if self._last_time_audit_report is None
-            else _time_report_safe(self._last_time_audit_report)
+            else _report_valid(self._last_time_audit_report)
         )
-        frequency_cost = stage_cost(
-            self._report, self.stage, self.position_target_hz
-        )
+        frequency_cost = stage_cost(self._report, self.stage)
         time_cost = time_stage_cost(self._time_report, self.stage)
-        fast_frequency_safe = bool(self._report["safety"]["safe"])
-        fast_time_safe = _time_report_safe(self._time_report)
+        total_cost = combined_stage_cost(self._report, self._time_report, self.stage)
+        fast_frequency_valid = _report_valid(self._report)
+        fast_time_valid = _report_valid(self._time_report)
+        fast_valid = bool(fast_frequency_valid and fast_time_valid)
+        target_pass = bool(
+            all(
+                self._report["performance_metrics"][loop]["target_pass"]
+                and self._time_report["performance_metrics"][loop]["target_pass"]
+                for loop in LOOP_ORDER
+            )
+        )
         return {
             "backend": self.backend,
             "stage": self.stage,
             "worker_rank": self.worker_rank,
             "step": self._step_count,
             "total_step": self._total_step_count,
-            "stage_cost": float(frequency_cost + time_cost),
+            "stage_cost": float(total_cost),
             "frequency_stage_cost": float(frequency_cost),
             "time_stage_cost": float(time_cost),
-            "fast_safe": bool(fast_frequency_safe and fast_time_safe),
-            "fast_frequency_safe": fast_frequency_safe,
-            "fast_time_safe": fast_time_safe,
+            "fast_valid": fast_valid,
+            "fast_frequency_valid": fast_frequency_valid,
+            "fast_time_valid": fast_time_valid,
+            # Compatibility aliases; safe now means evaluator validity, not target pass.
+            "fast_safe": fast_valid,
+            "fast_frequency_safe": fast_frequency_valid,
+            "fast_time_safe": fast_time_valid,
+            "target_pass": target_pass,
             "audit_performed": audit_performed,
+            "audit_valid": (
+                None
+                if audit_frequency_valid is None or audit_time_valid is None
+                else bool(audit_frequency_valid and audit_time_valid)
+            ),
+            "audit_frequency_valid": audit_frequency_valid,
+            "audit_time_valid": audit_time_valid,
             "audit_safe": (
                 None
-                if audit_frequency_safe is None or audit_time_safe is None
-                else bool(audit_frequency_safe and audit_time_safe)
+                if audit_frequency_valid is None or audit_time_valid is None
+                else bool(audit_frequency_valid and audit_time_valid)
             ),
-            "audit_frequency_safe": audit_frequency_safe,
-            "audit_time_safe": audit_time_safe,
+            "audit_frequency_safe": audit_frequency_valid,
+            "audit_time_safe": audit_time_valid,
             "sampled_model_ids": self.evaluator.model_ids(self._sampled_indices),
             "parameters": self._parameters.copy(),
         }
@@ -523,17 +432,26 @@ class PIDTuningEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         time_report = self.time_evaluator.train(candidate, self._sampled_indices)
         audit = self.evaluator.audit(candidate)
         time_audit = self.time_evaluator.audit(candidate)
-        if explicit is None and not (
-            bool(report["safety"]["safe"])
-            and _time_report_safe(time_report)
-            and bool(audit["safety"]["safe"])
-            and _time_report_safe(time_audit)
-        ):
+        reports_valid = bool(
+            _report_valid(report)
+            and _report_valid(time_report)
+            and _report_valid(audit)
+            and _report_valid(time_audit)
+        )
+        if explicit is None and not reports_valid:
             candidate = self._base_parameters.copy()
             report = self.evaluator.train(candidate, self._sampled_indices)
             time_report = self.time_evaluator.train(candidate, self._sampled_indices)
             audit = self.evaluator.audit(candidate)
             time_audit = self.time_evaluator.audit(candidate)
+            reports_valid = bool(
+                _report_valid(report)
+                and _report_valid(time_report)
+                and _report_valid(audit)
+                and _report_valid(time_audit)
+            )
+        if not reports_valid:
+            raise RuntimeError("no numerically valid initial controller is available")
 
         self._parameters = candidate
         self._report = report
@@ -544,9 +462,7 @@ class PIDTuningEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         self._sampled_frf = np.clip(sampled, -5.0, 5.0).astype(np.float32)
         friction = self.evaluator.friction_context_vector(self._sampled_indices)
         self._friction_context = np.clip(friction, -5.0, 5.0).astype(np.float32)
-        self._previous_stage_cost = combined_stage_cost(
-            report, time_report, self.stage, self.position_target_hz
-        )
+        self._previous_stage_cost = combined_stage_cost(report, time_report, self.stage)
         self._step_count = 0
         return self._observation(), self._info(audit_performed=True)
 
@@ -563,7 +479,7 @@ class PIDTuningEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         ):
             raise RuntimeError("environment must be reset before exporting state")
         return {
-            "schema_version": 3,
+            "schema_version": 4,
             "stage": self.stage,
             "worker_rank": self.worker_rank,
             "parameters": self._parameters.copy(),
@@ -589,7 +505,7 @@ class PIDTuningEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
     def restore_state(self, state: dict[str, Any]) -> None:
         """Restore a state produced by :meth:`export_state`."""
 
-        if int(state.get("schema_version", -1)) != 3:
+        if int(state.get("schema_version", -1)) != 4:
             raise ValueError("unsupported environment state schema")
         if state.get("stage") != self.stage:
             raise ValueError("environment state stage mismatch")
@@ -662,23 +578,22 @@ class PIDTuningEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         time_audit_report = (
             self.time_evaluator.audit(candidate) if audit_performed else None
         )
-        fast_safe = bool(report["safety"]["safe"]) and _time_report_safe(time_report)
-        audit_safe = (
+        fast_valid = _report_valid(report) and _report_valid(time_report)
+        audit_valid = (
             True
             if audit_report is None or time_audit_report is None
-            else bool(audit_report["safety"]["safe"])
-            and _time_report_safe(time_audit_report)
+            else _report_valid(audit_report) and _report_valid(time_audit_report)
         )
-        safe = fast_safe and audit_safe
-        new_stage_cost = combined_stage_cost(
-            report, time_report, self.stage, self.position_target_hz
-        )
+        valid = bool(fast_valid and audit_valid)
+        new_stage_cost = combined_stage_cost(report, time_report, self.stage)
+        if not np.isfinite(new_stage_cost):
+            new_stage_cost = 100.0
+            valid = False
         improvement = self._previous_stage_cost - new_stage_cost
-        action_penalty = 0.002 * float(np.sum(masked_action**2))
-        if safe:
-            reward = 10.0 * improvement - 0.02 * new_stage_cost - action_penalty
+        if valid:
+            reward = 10.0 * improvement - 0.02 * new_stage_cost
         else:
-            reward = -100.0 - action_penalty
+            reward = -100.0
 
         self._parameters = candidate
         self._report = report
@@ -688,17 +603,16 @@ class PIDTuningEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         if time_audit_report is not None:
             self._last_time_audit_report = time_audit_report
         self._previous_stage_cost = new_stage_cost
-        terminated = bool(not safe)
+        terminated = bool(not valid)
         truncated = bool(self._step_count >= self.max_episode_steps and not terminated)
         info = self._info(audit_performed=audit_performed)
         info["reward_components"] = {
             "improvement": float(improvement),
             "absolute_cost": float(new_stage_cost),
             "frequency_cost": float(
-                stage_cost(report, self.stage, self.position_target_hz)
+                stage_cost(report, self.stage)
             ),
             "time_cost": float(time_stage_cost(time_report, self.stage)),
-            "action_penalty": float(action_penalty),
-            "unsafe_penalty": 0.0 if safe else 100.0,
+            "invalid_penalty": 0.0 if valid else 100.0,
         }
         return self._observation(), float(reward), terminated, truncated, info

@@ -13,6 +13,9 @@ from elc_rl.physics_motor_model import (
 from elc_rl.physics_test_dataset import (
     FINAL_TEST_ENSEMBLE_RELATIVE_PATH,
     FINAL_TEST_MANIFEST_RELATIVE_PATH,
+    FINAL_TEST_SUITE_ID,
+    OFFICIAL_METRICS_PER_LOOP,
+    PERFORMANCE_TARGETS_RELATIVE_PATH,
     _dependency_sha256,
     build_physics_test_ensemble,
     construct_physics_test_ensemble,
@@ -42,8 +45,10 @@ def test_final_test_split_is_sealed_and_has_expected_roles():
         (PROJECT_ROOT / FINAL_TEST_MANIFEST_RELATIVE_PATH).read_text(encoding="utf-8")
     )
     assert ensemble["parameters"].shape == (24, len(MODEL_PARAMETER_NAMES))
-    assert int(ensemble["schema_version"]) == 2
-    assert manifest["schema_version"] == 2
+    assert int(ensemble["schema_version"]) == 3
+    assert manifest["schema_version"] == 3
+    assert str(ensemble["test_suite_id"].item()) == FINAL_TEST_SUITE_ID
+    assert manifest["test_suite_id"] == FINAL_TEST_SUITE_ID
     assert np.count_nonzero(ensemble["test_group"] == "in_distribution") == 16
     assert np.count_nonzero(ensemble["test_group"] == "ood") == 8
     assert np.all(ensemble["final_test_only"] == 1)
@@ -56,6 +61,10 @@ def test_final_test_split_is_sealed_and_has_expected_roles():
     assert manifest["test_ensemble_sha256"] == _sha256(
         PROJECT_ROOT / FINAL_TEST_ENSEMBLE_RELATIVE_PATH
     )
+    assert manifest["performance_targets_sha256"] == _dependency_sha256(
+        PROJECT_ROOT / PERFORMANCE_TARGETS_RELATIVE_PATH
+    )
+    assert tuple(manifest["official_metrics_per_loop"]) == OFFICIAL_METRICS_PER_LOOP
 
 
 def test_test_models_do_not_overlap_train_or_validation_models():
@@ -129,6 +138,7 @@ def test_training_runtime_does_not_import_or_name_final_test_artifacts():
     runtime_files = (
         PROJECT_ROOT / "src" / "elc_rl" / "tuning_env.py",
         PROJECT_ROOT / "src" / "elc_rl" / "physics_evaluator.py",
+        PROJECT_ROOT / "src" / "elc_rl" / "discrete_loop_model.py",
         PROJECT_ROOT / "src" / "elc_rl" / "transition_dataset.py",
         PROJECT_ROOT / "scripts" / "train_sac_smoke.py",
         PROJECT_ROOT / "src" / "elc_rl" / "sac_training.py",
@@ -143,19 +153,38 @@ def test_training_runtime_does_not_import_or_name_final_test_artifacts():
         assert not any(token in text for token in forbidden), path.name
 
 
-def test_final_test_thresholds_are_fixed_before_candidate_evaluation():
+def test_final_test_uses_only_the_six_fixed_targets_before_evaluation():
     spec = load_final_test_spec(PROJECT_ROOT)
-    thresholds = spec["acceptance_thresholds"]
-    assert thresholds["hard_all_24_models"]["closed_loop_stable"]
-    assert thresholds["hard_all_24_models"]["maximum_current_limit_ratio"] == 1.001
-    assert thresholds["minimum_phase_margin_deg"] == {
-        "current": 20.0,
-        "speed": 20.0,
-        "position": 25.0,
-    }
+    policy = spec["acceptance_policy"]
+    assert tuple(policy["official_metrics_per_loop"]) == OFFICIAL_METRICS_PER_LOOP
+    assert policy["bandwidth_reporting_tolerance_fraction"] == 0.1
+    assert policy["targets_source"] == str(
+        PERFORMANCE_TARGETS_RELATIVE_PATH
+    ).replace("\\", "/")
+    assert policy["all_24_models_must_pass_suite"]
+    assert "acceptance_thresholds" not in spec
+    for forbidden_key in (
+        "hard_all_24_models",
+        "minimum_phase_margin_deg",
+        "in_distribution_performance",
+    ):
+        assert forbidden_key not in policy
     assert not spec["isolation_policy"][
         "evaluate_candidate_before_training_is_locked"
     ]
+
+
+def test_versioned_paths_do_not_overwrite_the_legacy_test_artifacts():
+    spec = load_final_test_spec(PROJECT_ROOT)
+    assert FINAL_TEST_ENSEMBLE_RELATIVE_PATH.name == (
+        "physics_motor_six_metric_test_v2.npz"
+    )
+    assert FINAL_TEST_MANIFEST_RELATIVE_PATH.name == (
+        "physics_motor_six_metric_test_v2_manifest.json"
+    )
+    assert spec["output_policy"]["final_report"].startswith(
+        "outputs/final_test_v2/"
+    )
 
 
 def test_sealed_test_set_refuses_an_accidental_rebuild():

@@ -11,12 +11,25 @@ import numpy as np
 
 from .evaluation_utils import (
     GAIN_MARGIN_CAP_DB,
-    dobc_metrics,
     interpolate_pair,
-    summarize_loop_rows,
     zero_crossing_locations,
 )
 from .controller_parameters import load_physics_controller_parameter_space
+from .discrete_loop_model import (
+    DiscreteLoopModel,
+    build_discrete_loop_models,
+)
+from .performance_targets import (
+    FREQUENCY_ERROR_ORDER,
+    LOOP_ORDER,
+    TIME_ERROR_ORDER,
+    aggregate_loop_costs,
+    aggregate_model_costs,
+    frequency_normalized_errors,
+    load_controller_performance_targets,
+    metric_cost,
+    time_normalized_errors,
+)
 from .physics_motor_model import (
     MotorParameters,
     PhysicsMotorConfig,
@@ -72,6 +85,44 @@ def _series(
     return _tf(numerator, denominator)
 
 
+def _scale(
+    system: tuple[np.ndarray, np.ndarray], gain: float
+) -> tuple[np.ndarray, np.ndarray]:
+    numerator, denominator = system
+    return _tf(float(gain) * numerator, denominator)
+
+
+def _parallel(
+    left: tuple[np.ndarray, np.ndarray],
+    right: tuple[np.ndarray, np.ndarray],
+    *,
+    right_gain: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Add two rational systems, optionally negating/scaling the right one."""
+
+    left_num, left_den = left
+    right_num, right_den = right
+    return _tf(
+        np.polyadd(
+            np.convolve(left_num, right_den),
+            float(right_gain) * np.convolve(right_num, left_den),
+        ),
+        np.convolve(left_den, right_den),
+    )
+
+
+def _divide(
+    numerator_system: tuple[np.ndarray, np.ndarray],
+    denominator_system: tuple[np.ndarray, np.ndarray],
+) -> tuple[np.ndarray, np.ndarray]:
+    numerator_num, numerator_den = numerator_system
+    denominator_num, denominator_den = denominator_system
+    return _tf(
+        np.convolve(numerator_num, denominator_den),
+        np.convolve(numerator_den, denominator_num),
+    )
+
+
 def _feedback(
     forward: tuple[np.ndarray, np.ndarray],
     feedback: tuple[np.ndarray, np.ndarray] | None = None,
@@ -118,7 +169,12 @@ def physics_loop_transfers(
     motor: MotorParameters,
     controller_parameters: np.ndarray,
 ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-    """Construct internally consistent nested-loop linear transfer functions."""
+    """Construct legacy continuous transfers for plant-context diagnostics.
+
+    Reward, candidate audit and final evaluation use
+    :func:`build_discrete_loop_models`; this continuous representation remains
+    only for the 96-value plant context and held-out measured-FRF comparison.
+    """
 
     filters = config.derivative_filter_s
     electrical = _tf(
@@ -143,9 +199,48 @@ def physics_loop_transfers(
         _pid_values(controller_parameters, "speed"), filters["speed"]
     )
     current_to_speed = _series(current_closed, mechanical)
-    speed_forward = _series(speed_controller, current_to_speed)
-    speed_open = _series(speed_forward, speed_sensor)
-    speed_actual_closed = _feedback(speed_forward, speed_sensor)
+
+    # The DOBC is not a fourth loop.  It is an internal positive compensation
+    # path inside the speed controller.  Linearizing the implemented equations
+    # gives, from speed-loop current command to compensation current,
+    #
+    # D(s)=KG/Ktn * Q(s) * [Ktn*Ti(s)
+    #                       -(Jn*s+Bn)*Ti(s)*Gm(s)*Hspeed(s)].
+    #
+    # Hence the effective speed forward path is Cspeed*Ti*Gm/(1-D).  This makes
+    # both DOBC parameters affect the speed frequency metrics and, naturally,
+    # the outer position loop while leaving the standalone current loop intact.
+    nominal = config.nominal
+    dobc_gain = float(controller_parameters[6])
+    dobc_time_s = float(controller_parameters[7])
+    q_filter = _tf([1.0], [dobc_time_s, 1.0])
+    speed_measurement_from_iq_ref = _series(
+        current_closed, mechanical, speed_sensor
+    )
+    nominal_mechanical_operator = _tf(
+        [nominal.inertia_kg_m2, nominal.viscous_friction_nm_s_per_rad], [1.0]
+    )
+    estimator_from_iq_ref = _series(
+        q_filter,
+        _parallel(
+            _scale(current_closed, nominal.torque_constant_nm_per_a),
+            _series(nominal_mechanical_operator, speed_measurement_from_iq_ref),
+            right_gain=-1.0,
+        ),
+    )
+    dobc_return = _scale(
+        estimator_from_iq_ref,
+        dobc_gain / nominal.torque_constant_nm_per_a,
+    )
+    one_minus_dobc = _parallel(
+        _tf([1.0], [1.0]), dobc_return, right_gain=-1.0
+    )
+    speed_forward_without_dobc = _series(speed_controller, current_to_speed)
+    speed_effective_forward = _divide(
+        speed_forward_without_dobc, one_minus_dobc
+    )
+    speed_open = _series(speed_effective_forward, speed_sensor)
+    speed_actual_closed = _feedback(speed_effective_forward, speed_sensor)
 
     position_sensor = _tf([1.0], [motor.position_measurement_delay_s, 1.0])
     position_controller = _pid_tf(
@@ -160,6 +255,7 @@ def physics_loop_transfers(
         "current_closed": current_closed,
         "speed_open": speed_open,
         "speed_actual_closed": speed_actual_closed,
+        "dobc_return": dobc_return,
         "position_open": position_open,
         "electrical_plant": electrical,
         "speed_measurement_plant": _series(mechanical, speed_sensor),
@@ -179,28 +275,35 @@ def _frequency_grid(loop: str, points: int) -> np.ndarray:
 
 def _evaluate_open_loop(
     loop: str,
-    system: tuple[np.ndarray, np.ndarray],
+    model: DiscreteLoopModel,
     *,
     frequency_points: int,
 ) -> dict[str, float | bool]:
+    """Evaluate a sampled-data return ratio and its actual-output bandwidth."""
+
+    if model.loop != loop:
+        raise ValueError(f"discrete loop model mismatch: {model.loop} != {loop}")
     frequency_hz = _frequency_grid(loop, frequency_points)
-    open_loop = _response(system, frequency_hz)
+    nyquist_hz = 0.5 / model.sample_period_s
+    if float(frequency_hz[-1]) >= nyquist_hz:
+        raise ValueError(
+            f"{loop} frequency grid reaches {frequency_hz[-1]:g} Hz but "
+            f"its sampled model Nyquist frequency is {nyquist_hz:g} Hz"
+        )
+    open_loop = model.open_loop_response(frequency_hz)
     magnitude_db = 20.0 * np.log10(np.maximum(np.abs(open_loop), 1e-300))
     phase_deg = np.rad2deg(np.unwrap(np.angle(open_loop)))
     log_frequency = np.log10(frequency_hz)
 
     gain_crossings = zero_crossing_locations(log_frequency, magnitude_db)
     if gain_crossings:
-        crossover_hz = float(gain_crossings[0][0])
         phase_margin_deg = float(
             min(
-            180.0 + interpolate_pair(phase_deg, index, fraction)
+                180.0 + interpolate_pair(phase_deg, index, fraction)
                 for _, index, fraction in gain_crossings
             )
         )
     else:
-        lower, upper = PHYSICS_FREQUENCY_LIMITS_HZ[loop]
-        crossover_hz = float(lower if magnitude_db[0] < 0.0 else upper)
         phase_margin_deg = -180.0
 
     gain_margin_candidates: list[float] = []
@@ -219,41 +322,47 @@ def _evaluate_open_loop(
         else GAIN_MARGIN_CAP_DB
     )
 
-    sensitivity = 1.0 / (1.0 + open_loop)
-    complementary = open_loop / (1.0 + open_loop)
-    low_frequency_gain = float(abs(complementary[0]))
-    threshold = low_frequency_gain / np.sqrt(2.0)
-    bandwidth_indices = np.flatnonzero(np.abs(complementary) <= threshold)
-    bandwidth_hz = float(
-        frequency_hz[bandwidth_indices[0]]
-        if bandwidth_indices.size
-        else frequency_hz[-1]
+    closed_actual = model.closed_actual_response(frequency_hz)
+    low_frequency_gain = float(abs(closed_actual[0]))
+    relative_magnitude_db = 20.0 * np.log10(
+        np.maximum(
+            np.abs(closed_actual) / max(low_frequency_gain, 1e-300), 1e-300
+        )
     )
-    numerator, denominator = system
-    characteristic = _trim(np.polyadd(denominator, numerator))
-    poles = np.roots(characteristic / np.max(np.abs(characteristic)))
+    bandwidth_crossings = [
+        crossing
+        for crossing in zero_crossing_locations(
+            log_frequency, relative_magnitude_db + 10.0 * np.log10(2.0)
+        )
+        if relative_magnitude_db[crossing[1]] >= -10.0 * np.log10(2.0)
+        and relative_magnitude_db[crossing[1] + 1] < -10.0 * np.log10(2.0)
+    ]
+    bandwidth_found = bool(bandwidth_crossings)
+    bandwidth_hz = float(
+        bandwidth_crossings[0][0] if bandwidth_found else frequency_hz[-1]
+    )
+    poles = model.closed_loop_io_poles
     finite = bool(
         np.isfinite(open_loop.real).all()
         and np.isfinite(open_loop.imag).all()
+        and np.isfinite(closed_actual.real).all()
+        and np.isfinite(closed_actual.imag).all()
         and np.isfinite(poles.real).all()
         and np.isfinite(poles.imag).all()
     )
-    maximum_real_pole = float(np.max(poles.real))
-    pole_stable = bool(maximum_real_pole < -1e-8)
-    stable = bool(
-        finite and pole_stable and phase_margin_deg > 0.0 and gain_margin_db > 0.0
-    )
+    maximum_pole_magnitude = float(np.max(np.abs(poles)))
+    pole_stable = bool(maximum_pole_magnitude < 1.0 - 1e-10)
+    # Missing gain or -3 dB crossings are finite but poor controllers, not a
+    # numerical failure.  Their sentinel margins/bandwidth create a large Cost
+    # and target_pass remains false, while SAC is allowed to recover.  Only a
+    # non-finite response or an unstable discrete closed-loop I/O mode is invalid.
+    metric_valid = bool(finite and pole_stable)
     return {
-        "stable": stable,
-        "pade_stable": pole_stable,
-        "maximum_real_pole": maximum_real_pole,
-        "crossover_hz": crossover_hz,
+        "metric_valid": metric_valid,
         "phase_margin_deg": phase_margin_deg,
         "gain_margin_db": gain_margin_db,
         "bandwidth_hz": bandwidth_hz,
-        "low_frequency_gain": low_frequency_gain,
-        "sensitivity_peak": float(np.max(np.abs(sensitivity))),
-        "complementary_peak": float(np.max(np.abs(complementary))),
+        "bandwidth_found": bandwidth_found,
     }
 
 
@@ -267,121 +376,99 @@ def _physics_split(loop: str, role: str) -> str:
     }[loop]
 
 
-def _physics_cost_and_safety(
-    summaries: dict[str, dict[str, float | int]],
-    dobc: dict[str, float],
-    targets: dict[str, float],
-) -> tuple[dict[str, float], dict[str, Any]]:
-    core = {
-        "current": summaries["current_reference"],
-        "speed": summaries["speed_train"],
-        "position": summaries["position_surrogate"],
-    }
-    crossovers = {
-        loop: float(summary["crossover_hz_median"])
-        for loop, summary in core.items()
-    }
-    current_speed_ratio = crossovers["current"] / crossovers["speed"]
-    speed_position_ratio = crossovers["speed"] / crossovers["position"]
-    crossover_cost = float(
-        sum(abs(np.log(crossovers[loop] / targets[loop])) for loop in core)
-    )
-    margin_targets = {"current": 55.0, "speed": 55.0, "position": 55.0}
-    margin_cost = float(
-        sum(
-            max(0.0, margin_targets[loop] - float(core[loop]["phase_margin_deg_worst"]))
-            / margin_targets[loop]
-            for loop in core
-        )
-    )
-    sensitivity_cost = float(
-        sum(
-            max(0.0, float(summary["sensitivity_peak_worst"]) - 1.5)
-            for summary in core.values()
-        )
-    )
-    hierarchy_cost = float(
-        max(0.0, 4.0 - current_speed_ratio) / 4.0
-        + max(0.0, 3.0 - speed_position_ratio) / 3.0
-    )
-    uncertainty_cost = float(
-        sum(
-            np.log(
-                float(summary["crossover_hz_max"])
-                / float(summary["crossover_hz_min"])
+def _frequency_performance(
+    rows: list[dict[str, Any]], targets: Any
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Build the frequency half of the literal six-metric objective."""
+
+    settings = targets.cost
+    performance: dict[str, Any] = {}
+    loop_costs: dict[str, float] = {}
+    loop_validity: dict[str, bool] = {}
+    for loop in LOOP_ORDER:
+        loop_rows = [row for row in rows if row["loop"] == loop]
+        if not loop_rows:
+            raise ValueError(f"frequency evaluation has no {loop} rows")
+        target = targets.loop(loop)
+        row_costs: list[float] = []
+        row_errors: list[dict[str, float]] = []
+        for row in loop_rows:
+            errors = frequency_normalized_errors(
+                bandwidth_hz=float(row["bandwidth_hz"]),
+                gain_margin_db=float(row["gain_margin_db"]),
+                phase_margin_deg=float(row["phase_margin_deg"]),
+                target=target,
+                bandwidth_relative_scale=settings.bandwidth_relative_scale,
+                invalid_error=settings.invalid_normalized_error,
             )
-            for summary in core.values()
+            cost = metric_cost(errors, FREQUENCY_ERROR_ORDER, delta=settings.huber_delta)
+            row["normalized_errors"] = errors
+            row["frequency_cost"] = cost
+            row_errors.append(errors)
+            row_costs.append(cost)
+        bandwidth_errors = np.asarray(
+            [errors["bandwidth"] for errors in row_errors], dtype=np.float64
         )
-    )
-    dobc_cost = float(
-        dobc["ideal_0p1_to_10hz_residual_rms"]
-        + 0.15 * dobc["aggressiveness_proxy"]
-    )
-    stable_core = all(float(summary["stable_fraction"]) == 1.0 for summary in core.values())
-    margins_safe = all(
-        float(core[loop]["phase_margin_deg_worst"]) >= threshold
-        for loop, threshold in {"current": 35.0, "speed": 35.0, "position": 40.0}.items()
-    ) and all(float(summary["gain_margin_db_worst"]) >= 3.0 for summary in core.values())
-    peaks_safe = all(
-        float(summary["sensitivity_peak_worst"]) <= 2.5
-        for summary in core.values()
-    )
-    validation_summaries = [
-        summaries[name]
-        for name in ("current_validation", "speed_validation", "position_validation")
-        if name in summaries
-    ]
-    validation_safe = all(
-        float(summary["stable_fraction"]) == 1.0
-        and float(summary["phase_margin_deg_worst"]) >= 20.0
-        and float(summary["gain_margin_db_worst"]) >= 3.0
-        and float(summary["sensitivity_peak_worst"]) <= 3.0
-        for summary in validation_summaries
-    )
-    hierarchy_safe = current_speed_ratio >= 4.0 and speed_position_ratio >= 3.0
-    safe = bool(
-        stable_core
-        and margins_safe
-        and peaks_safe
-        and validation_safe
-        and hierarchy_safe
-    )
-    components = {
-        "crossover": crossover_cost,
-        "phase_margin": margin_cost,
-        "sensitivity": sensitivity_cost,
-        "bandwidth_hierarchy": hierarchy_cost,
-        "ensemble_uncertainty": uncertainty_cost,
-        "dobc_idealized": dobc_cost,
-        "unsafe": 0.0 if safe else 100.0,
+        representative_bandwidth_error = float(
+            bandwidth_errors[int(np.argmax(np.abs(bandwidth_errors)))]
+        )
+        normalized_errors = {
+            "bandwidth": representative_bandwidth_error,
+            "gain_margin": float(
+                max(errors["gain_margin"] for errors in row_errors)
+            ),
+            "phase_margin": float(
+                max(errors["phase_margin"] for errors in row_errors)
+            ),
+        }
+        valid = bool(all(bool(row["metric_valid"]) for row in loop_rows))
+        target_pass = bool(
+            valid
+            and all(
+                abs(float(row["bandwidth_hz"]) / target.bandwidth_hz - 1.0)
+                <= settings.bandwidth_relative_scale
+                and float(row["gain_margin_db"]) >= target.minimum_gain_margin_db
+                and float(row["phase_margin_deg"])
+                >= target.minimum_phase_margin_deg
+                for row in loop_rows
+            )
+        )
+        loop_cost = aggregate_model_costs(row_costs, settings)
+        loop_costs[loop] = loop_cost
+        loop_validity[loop] = valid
+        performance[loop] = {
+            "target": target.as_dict(),
+            "actual": {
+                "bandwidth_hz_median": float(
+                    np.median([float(row["bandwidth_hz"]) for row in loop_rows])
+                ),
+                "gain_margin_db_worst": float(
+                    min(float(row["gain_margin_db"]) for row in loop_rows)
+                ),
+                "phase_margin_deg_worst": float(
+                    min(float(row["phase_margin_deg"]) for row in loop_rows)
+                ),
+            },
+            "normalized_errors": normalized_errors,
+            "frequency_cost": loop_cost,
+            "valid": valid,
+            "target_pass": target_pass,
+        }
+    frequency_total = aggregate_loop_costs(loop_costs, settings)
+    cost = {
+        "loops": dict(loop_costs),
+        "frequency_total": frequency_total,
+        "total": frequency_total,
     }
-    components["total"] = float(
-        crossover_cost
-        + 2.0 * margin_cost
-        + sensitivity_cost
-        + 3.0 * hierarchy_cost
-        + 0.25 * uncertainty_cost
-        + 0.2 * dobc_cost
-        + components["unsafe"]
-    )
     safety = {
-        "safe": safe,
-        "stable_core_ensemble": stable_core,
-        "minimum_margins_satisfied": margins_safe,
-        "sensitivity_peaks_satisfied": peaks_safe,
-        "validation_and_robustness_satisfied": validation_safe,
-        "bandwidth_hierarchy_satisfied": hierarchy_safe,
-        "current_to_speed_crossover_ratio": current_speed_ratio,
-        "speed_to_position_crossover_ratio": speed_position_ratio,
-        "thresholds": {
-            "minimum_current_to_speed_ratio": 4.0,
-            "minimum_speed_to_position_ratio": 3.0,
-            "minimum_gain_margin_db": 3.0,
-            "maximum_sensitivity_peak": 2.5,
-            "validation_minimum_phase_margin_deg": 20.0,
-        },
+        "safe": bool(all(loop_validity.values())),
+        "frequency_metrics_valid": bool(all(loop_validity.values())),
+        "loop_validity": loop_validity,
+        "all_frequency_targets_met": bool(
+            all(performance[loop]["target_pass"] for loop in LOOP_ORDER)
+        ),
     }
-    return components, safety
+    return performance, cost, safety
 
 
 class PhysicsControllerEvaluator:
@@ -393,6 +480,9 @@ class PhysicsControllerEvaluator:
         self.project_root = Path(project_root).resolve()
         self.config = load_physics_motor_config(self.project_root)
         self.space = load_physics_controller_parameter_space(self.project_root)
+        self.performance_targets = load_controller_performance_targets(
+            self.project_root
+        )
         self.ensemble = load_physics_motor_ensemble(self.project_root)
         self.training_indices = np.flatnonzero(
             self.ensemble["active_for_training"] == 1
@@ -429,10 +519,13 @@ class PhysicsControllerEvaluator:
         values = self.validate_sampled_indices(indices)
         motor = self.motor(int(values[0]))
         systems = physics_loop_transfers(self.config, motor, self.space.initial)
-        crossover_targets = self.config.target_crossovers_hz
+        bandwidth_targets = {
+            loop: self.performance_targets.loop(loop).bandwidth_hz
+            for loop in LOOP_ORDER
+        }
         lower_ratio, upper_ratio = PHYSICS_OBSERVATION_CROSSOVER_RATIOS
         frequencies = {}
-        for loop, target_hz in crossover_targets.items():
+        for loop, target_hz in bandwidth_targets.items():
             physical_lower_hz, physical_upper_hz = PHYSICS_FREQUENCY_LIMITS_HZ[loop]
             lower_hz = max(physical_lower_hz, lower_ratio * target_hz)
             upper_hz = min(physical_upper_hz, upper_ratio * target_hz)
@@ -510,18 +603,13 @@ class PhysicsControllerEvaluator:
     ) -> dict[str, Any]:
         values = np.asarray(parameters, dtype=np.float64)
         self.space.normalize(values)
-        grouped: dict[str, list[dict[str, Any]]] = {}
         rows: list[dict[str, Any]] = []
         for raw_index in np.asarray(indices, dtype=np.int64):
             index = int(raw_index)
             motor = self.motor(index)
-            systems = physics_loop_transfers(self.config, motor, values)
+            models = build_discrete_loop_models(self.config, motor, values)
             role = str(self.ensemble["role"][index])
-            for loop, transfer_name in (
-                ("current", "current_open"),
-                ("speed", "speed_open"),
-                ("position", "position_open"),
-            ):
+            for loop in LOOP_ORDER:
                 split = _physics_split(loop, role)
                 row: dict[str, Any] = {
                     "model_id": str(self.ensemble["model_id"][index]),
@@ -530,24 +618,35 @@ class PhysicsControllerEvaluator:
                     "split": split,
                     **_evaluate_open_loop(
                         loop,
-                        systems[transfer_name],
+                        models[loop],
                         frequency_points=frequency_points,
                     ),
                 }
                 rows.append(row)
-                grouped.setdefault(split, []).append(row)
-        summaries = {
-            split: summarize_loop_rows(split_rows)
-            for split, split_rows in grouped.items()
-        }
-        required = {"current_reference", "speed_train", "position_surrogate"}
-        if not required.issubset(summaries):
-            raise ValueError("physics evaluation is missing training loop summaries")
-        dobc = dobc_metrics(values, self.space)
-        targets = self.config.target_crossovers_hz
-        cost, safety = _physics_cost_and_safety(summaries, dobc, targets)
+        training_rows = [row for row in rows if row["role"] != "validation"]
+        validation_rows = [row for row in rows if row["role"] == "validation"]
+        performance, cost, safety = _frequency_performance(
+            training_rows, self.performance_targets
+        )
+        validation_diagnostics = None
+        if validation_rows:
+            (
+                validation_performance,
+                validation_cost,
+                validation_safety,
+            ) = _frequency_performance(validation_rows, self.performance_targets)
+            validation_diagnostics = {
+                "performance_metrics": validation_performance,
+                "cost": validation_cost,
+                "safety": validation_safety,
+            }
+            safety["validation_metrics_valid"] = bool(
+                validation_safety["frequency_metrics_valid"]
+            )
+        else:
+            safety["validation_metrics_valid"] = None
         report: dict[str, Any] = {
-            "schema_version": 2,
+            "schema_version": 3,
             "backend": self.backend,
             "task_id": self.space.task_id,
             "evaluation_mode": mode,
@@ -555,26 +654,48 @@ class PhysicsControllerEvaluator:
             "parameters": values.tolist(),
             "evaluated_model_count": int(len(indices)),
             "evaluated_model_ids": list(self.model_ids(indices)),
-            "targets_hz": {
-                "current_reference": targets["current"],
-                "speed_train": targets["speed"],
-                "position_surrogate": targets["position"],
-            },
-            "splits": summaries,
-            "dobc": dobc,
+            "performance_targets": self.performance_targets.as_dict(),
+            "performance_metrics": performance,
             "cost": cost,
             "safety": safety,
+            "sample_periods_s": {
+                loop: self.config.sample_period_s_for(loop)
+                for loop in LOOP_ORDER
+            },
+            "controller_update_ratios": dict(
+                self.config.controller_update_ratios
+            ),
             "semantics": {
                 "motor": "mentor physics model with coherent per-episode uncertainty",
-                "current": "electrical plant plus current delay and filtered PID",
-                "speed": "closed current loop, Kt/(J*s+B), speed feedback lag and filtered PID",
-                "position": "closed actual-speed loop, integrator, position lag and filtered PID",
-                "dobc": self.config.payload["controller_design"]["dobc"]["structure"],
+                "frequency_model": "periodically lifted sampled-data state space: one outer-loop transition contains its integer number of 40 kHz current and motor substeps",
+                "current": "40 kHz sampled PIDF, discrete current actuator lag and explicit-Euler electrical state",
+                "speed": "5 kHz sampled PIDF and DOBC with a zero-order-held current reference over eight closed 40 kHz current, motor and LuGre substeps",
+                "position": "5 kHz sampled PIDF with the closed 5 kHz speed-plus-DOBC loop and eight closed 40 kHz current, motor and LuGre substeps",
+                "dobc": "embedded in the discrete speed and position models; evaluated only through their six metrics",
+                "objective": "closed-loop bandwidth, gain margin and phase margin only",
                 "measured_frf": "validation context only; not fitted into these model parameters",
+                "linearization_boundary": "small-signal zero-operating-point model; saturation, encoder quantization, hard termination and cross-rate alias images are excluded",
             },
         }
         if include_models:
-            report["models"] = rows
+            report["models"] = [
+                {
+                    "model_id": row["model_id"],
+                    "loop": row["loop"],
+                    "role": row["role"],
+                    "split": row["split"],
+                    "bandwidth_hz": row["bandwidth_hz"],
+                    "gain_margin_db": row["gain_margin_db"],
+                    "phase_margin_deg": row["phase_margin_deg"],
+                    "bandwidth_found": row["bandwidth_found"],
+                    "metric_valid": row["metric_valid"],
+                    "normalized_errors": row["normalized_errors"],
+                    "frequency_cost": row["frequency_cost"],
+                }
+                for row in rows
+            ]
+        if validation_diagnostics is not None:
+            report["validation_diagnostics"] = validation_diagnostics
         return report
 
     def train(
@@ -629,53 +750,109 @@ def _reference_metrics(trace: SimulationTrace) -> dict[str, float | bool]:
         "rise_time_s": rise_time,
         "settling_time_s": settling_time,
         "settled": settled,
+        "reached_10_percent": bool(ten.size),
+        "reached_90_percent": bool(ninety.size),
+        "reference_metric_valid": bool(
+            np.isfinite(trace.time_s).all()
+            and np.isfinite(trace.reference).all()
+            and np.isfinite(trace.output).all()
+            and np.isfinite(trace.primary_control).all()
+            and np.isfinite(trace.voltage_v).all()
+            and np.isfinite(trace.current_a).all()
+            and np.isfinite(normalized).all()
+        ),
         "overshoot_ratio": max(0.0, float(np.max(normalized) - 1.0)),
-        "steady_state_error": abs(float(error[-1])),
-        "iae": float(np.trapezoid(np.abs(error), trace.time_s)),
-        "rms_error": float(np.sqrt(np.mean(error**2))),
-        "output_peak": float(np.max(np.abs(normalized))),
     }
 
 
-def _control_metrics(trace: SimulationTrace) -> dict[str, float]:
-    slew = np.diff(trace.primary_control) / np.diff(trace.time_s)
-    return {
-        "control_peak": float(np.max(np.abs(trace.primary_control))),
-        "control_rms": float(np.sqrt(np.mean(trace.primary_control**2))),
-        "control_slew_peak": float(np.max(np.abs(slew))) if slew.size else 0.0,
-    }
+def _time_performance(
+    rows: list[dict[str, Any]], targets: Any
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Build the time half of the literal six-metric objective."""
 
-
-def _disturbance_metrics(
-    trace: SimulationTrace, disturbance_start_s: float
-) -> dict[str, float | bool]:
-    start = int(np.searchsorted(trace.time_s, disturbance_start_s))
-    time_s = trace.time_s[start:] - trace.time_s[start]
-    deviation = trace.output[start:] - trace.reference[start:]
-    absolute = np.abs(deviation)
-    peak_index = int(np.argmax(absolute))
-    peak = float(absolute[peak_index])
-    threshold = max(0.02 * peak, 1e-6)
-    outside = np.flatnonzero(absolute[peak_index:] > threshold)
-    recovered = bool(not outside.size or peak_index + outside[-1] < len(absolute) - 1)
-    recovery_time = (
-        0.0
-        if not outside.size
-        else float(
-            time_s[min(peak_index + int(outside[-1]) + 1, len(time_s) - 1)]
-            - time_s[peak_index]
+    settings = targets.cost
+    performance: dict[str, Any] = {}
+    loop_costs: dict[str, float] = {}
+    loop_validity: dict[str, bool] = {}
+    for loop in LOOP_ORDER:
+        loop_rows = [row for row in rows if row["loop"] == loop]
+        if not loop_rows:
+            raise ValueError(f"time-domain evaluation has no {loop} rows")
+        target = targets.loop(loop)
+        row_costs: list[float] = []
+        row_errors: list[dict[str, float]] = []
+        for row in loop_rows:
+            errors = time_normalized_errors(
+                overshoot_ratio=float(row["overshoot_ratio"]),
+                rise_time_s=float(row["rise_time_s"]),
+                settling_time_s=float(row["settling_time_s"]),
+                target=target,
+                invalid_error=settings.invalid_normalized_error,
+            )
+            cost = metric_cost(errors, TIME_ERROR_ORDER, delta=settings.huber_delta)
+            row["normalized_errors"] = errors
+            row["time_cost"] = cost
+            row_errors.append(errors)
+            row_costs.append(cost)
+        normalized_errors = {
+            name: float(max(errors[name] for errors in row_errors))
+            for name in TIME_ERROR_ORDER
+        }
+        valid = bool(
+            all(
+                bool(row["time_domain_stable"])
+                and bool(row["reference_metric_valid"])
+                for row in loop_rows
+            )
         )
-    )
-    return {
-        "disturbance_peak": peak,
-        "disturbance_iae": float(np.trapezoid(absolute, time_s)),
-        "disturbance_recovery_time_s": recovery_time,
-        "disturbance_recovered": recovered,
+        target_pass = bool(
+            valid
+            and all(
+                bool(row["reached_90_percent"])
+                and bool(row["settled"])
+                and float(row["overshoot_ratio"])
+                <= target.maximum_overshoot_ratio
+                and float(row["rise_time_s"]) <= target.maximum_rise_time_s
+                and float(row["settling_time_s"])
+                <= target.maximum_settling_time_s
+                for row in loop_rows
+            )
+        )
+        loop_cost = aggregate_model_costs(row_costs, settings)
+        loop_costs[loop] = loop_cost
+        loop_validity[loop] = valid
+        performance[loop] = {
+            "target": target.as_dict(),
+            "actual": {
+                "overshoot_ratio_worst": float(
+                    max(float(row["overshoot_ratio"]) for row in loop_rows)
+                ),
+                "rise_time_s_worst": float(
+                    max(float(row["rise_time_s"]) for row in loop_rows)
+                ),
+                "settling_time_s_worst": float(
+                    max(float(row["settling_time_s"]) for row in loop_rows)
+                ),
+            },
+            "normalized_errors": normalized_errors,
+            "time_cost": loop_cost,
+            "valid": valid,
+            "target_pass": target_pass,
+        }
+    time_total = aggregate_loop_costs(loop_costs, settings)
+    cost = {
+        "loops": dict(loop_costs),
+        "time_total": time_total,
+        "total": time_total,
     }
-
-
-def _safe_ratio(value: float, baseline: float) -> float:
-    return float(value / max(abs(baseline), 1e-12))
+    safety = {
+        "time_metrics_valid": bool(all(loop_validity.values())),
+        "loop_validity": loop_validity,
+        "all_time_targets_met": bool(
+            all(performance[loop]["target_pass"] for loop in LOOP_ORDER)
+        ),
+    }
+    return performance, cost, safety
 
 
 class PhysicsTimeDomainEvaluator:
@@ -688,8 +865,8 @@ class PhysicsTimeDomainEvaluator:
         self.project_root = frequency_evaluator.project_root
         self.config = frequency_evaluator.config
         self.space = frequency_evaluator.space
+        self.performance_targets = frequency_evaluator.performance_targets
         self.ensemble = frequency_evaluator.ensemble
-        self._baseline_cache: dict[tuple[int, str], dict[str, Any]] = {}
         validation = np.flatnonzero(self.ensemble["role"] == "validation").astype(
             np.int64
         )
@@ -710,153 +887,16 @@ class PhysicsTimeDomainEvaluator:
             parameters,
             scenario,
         )
-        limits = self.config.limits
         metrics: dict[str, Any] = {
             "time_domain_stable": bool(not trace.terminated),
-            "maximum_real_pole": 0.0 if not trace.terminated else 1.0,
-            "derivative_filter_time_s": self.config.derivative_filter_s.get(
-                "speed" if scenario == "disturbance" else scenario, 0.0
-            ),
-            "saturation_count": trace.saturation_count,
-            "voltage_peak_v": float(np.max(np.abs(trace.voltage_v))),
-            "current_peak_a": float(np.max(np.abs(trace.current_a))),
-            "speed_peak_rad_s": float(np.max(np.abs(trace.speed_rad_s))),
-            "friction_torque_peak_nm": float(
-                np.max(np.abs(trace.friction_torque_nm))
-            ),
-            "friction_torque_rms_nm": float(
-                np.sqrt(np.mean(trace.friction_torque_nm**2))
-            ),
-            "bristle_state_peak_rad": float(
-                np.max(np.abs(trace.bristle_state_rad))
-            ),
-            "bristle_rate_peak_rad_s": float(
-                np.max(np.abs(trace.bristle_rate_rad_s))
-            ),
-            "voltage_limit_ratio": float(
-                np.max(np.abs(trace.voltage_v)) / float(limits["voltage_v"])
-            ),
-            "current_limit_ratio": float(
-                np.max(np.abs(trace.current_a)) / float(limits["hard_current_a"])
-            ),
-            "speed_limit_ratio": float(
-                np.max(np.abs(trace.speed_rad_s)) / float(limits["hard_speed_rad_s"])
-            ),
         }
-        if scenario == "disturbance":
-            metrics.update(
-                _disturbance_metrics(
-                    trace, self.config.scenarios["disturbance_start_s"]
-                )
-            )
-        else:
-            metrics.update(_reference_metrics(trace))
-            metrics.update(_control_metrics(trace))
+        metrics.update(_reference_metrics(trace))
         return metrics
-
-    def _baseline(self, index: int, scenario: str) -> dict[str, Any]:
-        key = (index, scenario)
-        if key not in self._baseline_cache:
-            self._baseline_cache[key] = self._raw_scenario(
-                index, scenario, self.space.initial
-            )
-        return self._baseline_cache[key]
 
     def _model_metrics(
         self, index: int, loop: str, parameters: np.ndarray
     ) -> dict[str, Any]:
-        metrics = self._raw_scenario(index, loop, parameters)
-        is_baseline = np.array_equal(
-            np.asarray(parameters, dtype=np.float64), self.space.initial
-        )
-        if is_baseline:
-            self._baseline_cache[(index, loop)] = dict(metrics)
-            baseline = metrics
-        else:
-            baseline = self._baseline(index, loop)
-        for name in ("control_peak", "control_rms", "control_slew_peak", "iae"):
-            metrics[f"{name}_ratio_to_baseline"] = _safe_ratio(
-                float(metrics[name]), float(baseline[name])
-            )
-        if loop == "speed":
-            disturbance = self._raw_scenario(index, "disturbance", parameters)
-            if is_baseline:
-                self._baseline_cache[(index, "disturbance")] = dict(disturbance)
-                disturbance_baseline = disturbance
-            else:
-                disturbance_baseline = self._baseline(index, "disturbance")
-            metrics.update(
-                {
-                    key: value
-                    for key, value in disturbance.items()
-                    if key.startswith("disturbance_")
-                }
-            )
-            for name in ("disturbance_peak", "disturbance_iae"):
-                metrics[f"{name}_ratio_to_baseline"] = _safe_ratio(
-                    float(metrics[name]), float(disturbance_baseline[name])
-                )
-        return metrics
-
-    @staticmethod
-    def _summary(rows: list[dict[str, Any]]) -> dict[str, float | int]:
-        def values(name: str) -> np.ndarray:
-            return np.asarray([float(row[name]) for row in rows], dtype=np.float64)
-
-        summary: dict[str, float | int] = {
-            "model_count": len(rows),
-            "stable_count": int(sum(bool(row["time_domain_stable"]) for row in rows)),
-            "stable_fraction": float(
-                np.mean([bool(row["time_domain_stable"]) for row in rows])
-            ),
-            "rise_time_s_median": float(np.median(values("rise_time_s"))),
-            "settling_time_s_worst": float(np.max(values("settling_time_s"))),
-            "overshoot_ratio_worst": float(np.max(values("overshoot_ratio"))),
-            "steady_state_error_worst": float(np.max(values("steady_state_error"))),
-            "iae_ratio_to_baseline_median": float(
-                np.median(values("iae_ratio_to_baseline"))
-            ),
-            "control_peak_ratio_to_baseline_worst": float(
-                np.max(values("control_peak_ratio_to_baseline"))
-            ),
-            "control_rms_ratio_to_baseline_worst": float(
-                np.max(values("control_rms_ratio_to_baseline"))
-            ),
-            "control_slew_ratio_to_baseline_worst": float(
-                np.max(values("control_slew_peak_ratio_to_baseline"))
-            ),
-            "voltage_limit_ratio_worst": float(np.max(values("voltage_limit_ratio"))),
-            "current_limit_ratio_worst": float(np.max(values("current_limit_ratio"))),
-            "speed_limit_ratio_worst": float(np.max(values("speed_limit_ratio"))),
-            "friction_torque_peak_nm_worst": float(
-                np.max(values("friction_torque_peak_nm"))
-            ),
-            "friction_torque_rms_nm_worst": float(
-                np.max(values("friction_torque_rms_nm"))
-            ),
-            "bristle_state_peak_rad_worst": float(
-                np.max(values("bristle_state_peak_rad"))
-            ),
-            "bristle_rate_peak_rad_s_worst": float(
-                np.max(values("bristle_rate_peak_rad_s"))
-            ),
-            "saturation_count_worst": int(np.max(values("saturation_count"))),
-        }
-        if "disturbance_peak" in rows[0]:
-            summary.update(
-                {
-                    "disturbance_peak_ratio_to_baseline_worst": float(
-                        np.max(values("disturbance_peak_ratio_to_baseline"))
-                    ),
-                    "disturbance_iae_ratio_to_baseline_median": float(
-                        np.median(values("disturbance_iae_ratio_to_baseline"))
-                    ),
-                    "disturbance_recovery_time_s_worst": float(
-                        np.max(values("disturbance_recovery_time_s"))
-                    ),
-                }
-            )
-        return summary
+        return self._raw_scenario(index, loop, parameters)
 
     def evaluate(
         self,
@@ -868,7 +908,6 @@ class PhysicsTimeDomainEvaluator:
     ) -> dict[str, Any]:
         values = np.asarray(parameters, dtype=np.float64)
         self.space.normalize(values)
-        grouped: dict[str, list[dict[str, Any]]] = {}
         rows: list[dict[str, Any]] = []
         for raw_index in np.asarray(indices, dtype=np.int64):
             index = int(raw_index)
@@ -883,51 +922,80 @@ class PhysicsTimeDomainEvaluator:
                     **self._model_metrics(index, loop, values),
                 }
                 rows.append(row)
-                grouped.setdefault(split, []).append(row)
-        summaries = {
-            split: self._summary(split_rows) for split, split_rows in grouped.items()
-        }
-        core_names = ("current_reference", "speed_train", "position_surrogate")
-        core_safe = all(
-            float(summaries[name]["stable_fraction"]) == 1.0
-            and float(summaries[name]["current_limit_ratio_worst"]) <= 1.001
-            and float(summaries[name]["speed_limit_ratio_worst"]) <= 1.001
-            and float(summaries[name]["voltage_limit_ratio_worst"]) <= 1.001
-            for name in core_names
+        training_rows = [row for row in rows if row["role"] != "validation"]
+        validation_rows = [row for row in rows if row["role"] == "validation"]
+        performance, cost, performance_safety = _time_performance(
+            training_rows, self.performance_targets
         )
-        validation_names = [name for name in summaries if name.endswith("_validation")]
-        validation_safe = all(
-            float(summaries[name]["stable_fraction"]) == 1.0
-            and float(summaries[name]["current_limit_ratio_worst"]) <= 1.001
-            and float(summaries[name]["speed_limit_ratio_worst"]) <= 1.001
-            and float(summaries[name]["voltage_limit_ratio_worst"]) <= 1.001
-            for name in validation_names
+        validation_diagnostics = None
+        if validation_rows:
+            (
+                validation_performance,
+                validation_cost,
+                validation_performance_safety,
+            ) = _time_performance(validation_rows, self.performance_targets)
+            validation_diagnostics = {
+                "performance_metrics": validation_performance,
+                "cost": validation_cost,
+                "safety": validation_performance_safety,
+            }
+        metrics_valid = bool(performance_safety["time_metrics_valid"])
+        validation_metrics_valid = bool(
+            True
+            if validation_diagnostics is None
+            else validation_diagnostics["safety"]["time_metrics_valid"]
         )
         report: dict[str, Any] = {
-            "schema_version": 2,
+            "schema_version": 3,
             "backend": self.backend,
             "task_id": self.space.task_id,
             "evaluation_mode": mode,
             "evaluated_model_count": int(len(indices)),
             "evaluated_model_ids": list(self.frequency_evaluator.model_ids(indices)),
-            "splits": summaries,
+            "performance_targets": self.performance_targets.as_dict(),
+            "performance_metrics": performance,
+            "cost": cost,
             "safety": {
-                "safe": bool(core_safe and validation_safe),
-                "core_limits_and_termination_safe": core_safe,
-                "validation_limits_and_termination_safe": validation_safe,
+                "safe": metrics_valid,
+                "core_metrics_valid": metrics_valid,
+                "validation_metrics_valid": (
+                    None
+                    if validation_diagnostics is None
+                    else validation_metrics_valid
+                ),
+                **performance_safety,
             },
             "assumptions": {
                 "integration_step_s": self.config.sample_period_s,
                 "controller": "three filtered PID controllers with conditional anti-windup",
-                "actuator_limits": "derived simulation-validity envelope, not hardware ratings",
-                "disturbance": "positive resisting load-torque step at the mechanical shaft",
                 "dobc": self.config.payload["controller_design"]["dobc"]["structure"],
+                "objective": "overshoot, 10-to-90-percent rise time and plus-or-minus-2-percent settling time only",
                 "friction": self.config.payload["friction_model"],
                 "encoder_effects_during_reward": False,
             },
         }
         if include_models:
-            report["models"] = rows
+            report["models"] = [
+                {
+                    "model_id": row["model_id"],
+                    "loop": row["loop"],
+                    "role": row["role"],
+                    "split": row["split"],
+                    "overshoot_ratio": row["overshoot_ratio"],
+                    "rise_time_s": row["rise_time_s"],
+                    "settling_time_s": row["settling_time_s"],
+                    "reached_10_percent": row["reached_10_percent"],
+                    "reached_90_percent": row["reached_90_percent"],
+                    "settled": row["settled"],
+                    "reference_metric_valid": row["reference_metric_valid"],
+                    "time_domain_stable": row["time_domain_stable"],
+                    "normalized_errors": row["normalized_errors"],
+                    "time_cost": row["time_cost"],
+                }
+                for row in rows
+            ]
+        if validation_diagnostics is not None:
+            report["validation_diagnostics"] = validation_diagnostics
         return report
 
     def train(

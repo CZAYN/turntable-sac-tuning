@@ -11,6 +11,7 @@ from elc_rl.sac_training import (
     CandidatePool,
     CandidateRecord,
     StopController,
+    TRAINING_PROTOCOL_SCHEMA_VERSION,
     TrainingProgressReporter,
     _effective_sac_parameters,
     _load_checkpoint,
@@ -30,6 +31,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 def test_formal_training_configuration_is_complete_and_multi_seed():
     config = load_formal_training_config(PROJECT_ROOT)
     assert tuple(stage.name for stage in config.stages) == STAGE_ORDER
+    assert STAGE_ORDER == ("current", "speed", "position", "joint")
+    assert "dobc" not in STAGE_ORDER
     assert all(stage.total_timesteps > 0 for stage in config.stages)
     assert len(config.seeds) >= 3
     assert len(set(config.seeds)) == len(config.seeds)
@@ -43,10 +46,13 @@ def test_training_input_manifest_is_deterministic_and_training_only():
     first = build_training_input_manifest(PROJECT_ROOT, config)
     second = build_training_input_manifest(PROJECT_ROOT, config)
     assert first == second
+    assert first["schema_version"] == TRAINING_PROTOCOL_SCHEMA_VERSION
     assert len(first["fingerprint"]) == 64
     names = {item["path"] for item in first["files"]}
     assert "data/processed/physics_motor_ensemble.npz" in names
     assert "scripts/train_sac.py" in names
+    assert "config/controller_performance_targets.json" in names
+    assert "src/elc_rl/performance_targets.py" in names
     assert not any("physics_motor_test" in name for name in names)
     assert not any("final_test" in name for name in names)
     assert not any("frf_tasks" in name for name in names)
@@ -96,6 +102,8 @@ class _FakeSAC:
 def test_resume_checkpoint_is_complete_and_rotated(tmp_path):
     config = load_formal_training_config(PROJECT_ROOT)
     state = {
+        "schema_version": TRAINING_PROTOCOL_SCHEMA_VERSION,
+        "stage_order": list(STAGE_ORDER),
         "stage_index": 0,
         "stage": "current",
         "stage_timesteps_completed": 0,
@@ -127,6 +135,11 @@ def test_resume_checkpoint_is_complete_and_rotated(tmp_path):
     persisted = json.loads(
         (tmp_path / "trainer_state.json").read_text(encoding="utf-8")
     )
+    metadata = json.loads(
+        (checkpoint / "checkpoint.json").read_text(encoding="utf-8")
+    )
+    assert metadata["schema_version"] == TRAINING_PROTOCOL_SCHEMA_VERSION
+    assert tuple(metadata["stage_order"]) == STAGE_ORDER
     assert persisted["global_timesteps_completed"] == 30
     assert (tmp_path / persisted["latest_checkpoint"]).is_dir()
 
@@ -134,6 +147,8 @@ def test_resume_checkpoint_is_complete_and_rotated(tmp_path):
 def test_resume_checkpoint_contains_every_vector_environment_state(tmp_path):
     config = load_formal_training_config(PROJECT_ROOT)
     state = {
+        "schema_version": TRAINING_PROTOCOL_SCHEMA_VERSION,
+        "stage_order": list(STAGE_ORDER),
         "stage_index": 0,
         "stage": "current",
         "stage_timesteps_completed": 8,
@@ -184,12 +199,16 @@ def test_resume_at_stage_boundary_starts_fresh_environment(
     (checkpoint / "checkpoint.json").write_text(
         json.dumps(
             {
+                "schema_version": TRAINING_PROTOCOL_SCHEMA_VERSION,
+                "stage_order": list(STAGE_ORDER),
                 "stage": "current",
                 "stage_index": 0,
                 "stage_timesteps_completed": 80,
                 "global_timesteps_completed": 80,
                 "n_envs": 2,
                 "environment_state_saved": True,
+                "config_sha256": "config",
+                "input_fingerprint": "fingerprint",
             }
         ),
         encoding="utf-8",
@@ -200,6 +219,8 @@ def test_resume_at_stage_boundary_starts_fresh_environment(
         "stage_index": 1,
         "stage_timesteps_completed": 0,
         "global_timesteps_completed": 80,
+        "config_sha256": "config",
+        "input_fingerprint": "fingerprint",
     }
     load_arguments = {}
     loaded_model = SimpleNamespace(num_timesteps=80)
@@ -228,6 +249,40 @@ def test_resume_at_stage_boundary_starts_fresh_environment(
     assert result is loaded_model
     assert load_arguments["force_reset"]
     assert environment.restored == []
+
+
+def test_old_five_stage_checkpoint_schema_is_rejected(tmp_path):
+    checkpoint = tmp_path / "checkpoints" / "old_protocol"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "COMPLETE").write_text("complete\n", encoding="utf-8")
+    (checkpoint / "checkpoint.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "stage": "dobc",
+                "stage_index": 3,
+                "stage_timesteps_completed": 1,
+                "global_timesteps_completed": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    state = {
+        "latest_checkpoint": "checkpoints/old_protocol",
+        "stage": "position",
+        "stage_index": 2,
+        "stage_timesteps_completed": 1,
+        "global_timesteps_completed": 1,
+    }
+    with pytest.raises(ValueError, match="checkpoint schema"):
+        _load_checkpoint(
+            tmp_path,
+            state,
+            _ResumeVecEnv(),
+            "cpu",
+            None,
+            expect_replay_buffer=False,
+        )
 
 
 def test_parallel_sampling_preserves_gradient_updates_per_transition():
@@ -311,6 +366,9 @@ def test_engineering_candidate_is_rejected_by_formal_selection(tmp_path):
         training_complete=np.asarray(True),
         eligible_for_selection=np.asarray(False),
         input_fingerprint=np.asarray("a" * 64),
+        training_protocol_schema_version=np.asarray(
+            TRAINING_PROTOCOL_SCHEMA_VERSION, dtype=np.int64
+        ),
     )
     with pytest.raises(ValueError, match="not eligible"):
         select_multi_seed_candidate(
@@ -331,6 +389,7 @@ def test_candidate_from_old_training_protocol_is_rejected(tmp_path):
         training_complete=np.asarray(True),
         eligible_for_selection=np.asarray(True),
         input_fingerprint=np.asarray("a" * 64),
+        training_protocol_schema_version=np.asarray(1, dtype=np.int64),
     )
     with pytest.raises(ValueError, match="does not match current protocol"):
         select_multi_seed_candidate(

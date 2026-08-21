@@ -2,7 +2,7 @@
   "schema_version": 1,
   "backend": "physics",
   "run_name": "sac_training",
-  "description": "Server-oriented staged SAC training for the 11-D three-loop PIDF and DOBC tuner.",
+  "description": "Local four-stage SAC training for the 11-D three-loop PIDF tuner with DOBC integrated into the speed stage.",
   "default_device": "cuda",
   "seeds": [
     20260801,
@@ -16,15 +16,11 @@
     },
     {
       "name": "speed",
-      "total_timesteps": 40000
+      "total_timesteps": 70000
     },
     {
       "name": "position",
       "total_timesteps": 40000
-    },
-    {
-      "name": "dobc",
-      "total_timesteps": 30000
     },
     {
       "name": "joint",
