@@ -29,10 +29,13 @@ from stable_baselines3.common.vec_env import VecEnv
 import torch
 
 from .parallel_env import configure_thread_limits, create_training_vec_env
-from .tuning_env import PIDTuningEnv, STAGE_ORDER
+from .plant_sampling import PlantSamplingConfig
+from .sampling_vec_env import PlantSamplingVecEnv
+from .tuning_env import PIDTuningEnv, STAGE_ORDER, combined_stage_cost
 
 
 TRAINING_INPUT_RELATIVE_PATHS = (
+    "config/controller_acceptance_tolerances.json",
     "config/controller_performance_targets.json",
     "config/motor_physics.json",
     "data/processed/controller_parameter_space.json",
@@ -43,6 +46,8 @@ TRAINING_INPUT_RELATIVE_PATHS = (
     "src/elc_rl/discrete_loop_model.py",
     "src/elc_rl/evaluation_utils.py",
     "src/elc_rl/parallel_env.py",
+    "src/elc_rl/plant_sampling.py",
+    "src/elc_rl/sampling_vec_env.py",
     "src/elc_rl/performance_targets.py",
     "src/elc_rl/physics_evaluator.py",
     "src/elc_rl/physics_motor_model.py",
@@ -53,7 +58,7 @@ TRAINING_INPUT_RELATIVE_PATHS = (
 )
 
 PROGRESS_REPORT_INTERVAL_TIMESTEPS = 1000
-TRAINING_PROTOCOL_SCHEMA_VERSION = 3
+TRAINING_PROTOCOL_SCHEMA_VERSION = 6
 
 
 def utc_now() -> str:
@@ -194,6 +199,10 @@ def load_formal_training_config(
     if not 0.0 <= float(environment["initial_perturbation"]) <= 0.5:
         raise ValueError("initial_perturbation must be between 0 and 0.5")
 
+    sampling = PlantSamplingConfig.from_mapping(payload.get("plant_sampling"))
+    if sampling.maximum_probability < 1.0 / 40:
+        raise ValueError("plant maximum_probability is below the 40-model uniform probability")
+
     sac = payload["sac"]
     _required_keys(
         sac,
@@ -326,6 +335,9 @@ def build_training_input_manifest(
     except ValueError:
         relative_config = str(config.path)
     paths = list(TRAINING_INPUT_RELATIVE_PATHS)
+    anchor_path = "data/processed/training_anchor.json"
+    if (root / anchor_path).is_file():
+        paths.append(anchor_path)
     if relative_config not in paths:
         paths.append(relative_config)
 
@@ -335,11 +347,14 @@ def build_training_input_manifest(
         path = candidate if candidate.is_absolute() else root / candidate
         if not path.is_file():
             raise FileNotFoundError(f"missing formal-training input: {path}")
+        content = path.read_bytes()
+        if path.suffix in {".py", ".json"}:
+            content = content.replace(b"\r\n", b"\n")
         files.append(
             {
                 "path": name.replace("\\", "/"),
-                "size_bytes": path.stat().st_size,
-                "sha256": sha256_file(path),
+                "size_bytes": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
             }
         )
     fingerprint = hashlib.sha256(_canonical_json(files)).hexdigest()
@@ -348,6 +363,7 @@ def build_training_input_manifest(
         "backend": "physics",
         "files": files,
         "fingerprint": fingerprint,
+        "fingerprint_encoding": "UTF-8 source/JSON with LF newlines; binary inputs unchanged",
     }
 
 
@@ -357,6 +373,9 @@ class CandidateRecord:
     fast_cost: float
     parameters: np.ndarray
     global_timestep: int
+    fast_target_pass: bool = False
+    fast_maximum_target_violation: float = float("inf")
+    fast_target_violation_count: int = 2**31 - 1
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -364,6 +383,13 @@ class CandidateRecord:
             "fast_cost": float(self.fast_cost),
             "parameters": np.asarray(self.parameters, dtype=np.float64).tolist(),
             "global_timestep": int(self.global_timestep),
+            "fast_target_pass": bool(self.fast_target_pass),
+            "fast_maximum_target_violation": float(
+                self.fast_maximum_target_violation
+            ),
+            "fast_target_violation_count": int(
+                self.fast_target_violation_count
+            ),
         }
 
     @classmethod
@@ -376,7 +402,24 @@ class CandidateRecord:
             fast_cost=float(payload["fast_cost"]),
             parameters=parameters,
             global_timestep=int(payload["global_timestep"]),
+            fast_target_pass=bool(payload["fast_target_pass"]),
+            fast_maximum_target_violation=float(
+                payload["fast_maximum_target_violation"]
+            ),
+            fast_target_violation_count=int(
+                payload["fast_target_violation_count"]
+            ),
         )
+
+
+def _candidate_record_rank(record: CandidateRecord) -> tuple[Any, ...]:
+    return (
+        not bool(record.fast_target_pass),
+        float(record.fast_maximum_target_violation),
+        int(record.fast_target_violation_count),
+        float(record.fast_cost),
+        int(record.global_timestep),
+    )
 
 
 class CandidatePool:
@@ -416,12 +459,17 @@ class CandidatePool:
             None,
         )
         if duplicate is not None:
-            if record.fast_cost < duplicate.fast_cost:
+            if _candidate_record_rank(record) < _candidate_record_rank(duplicate):
                 duplicate.fast_cost = float(record.fast_cost)
                 duplicate.global_timestep = int(record.global_timestep)
-                self.records.sort(
-                    key=lambda item: (item.fast_cost, item.global_timestep)
+                duplicate.fast_target_pass = bool(record.fast_target_pass)
+                duplicate.fast_maximum_target_violation = float(
+                    record.fast_maximum_target_violation
                 )
+                duplicate.fast_target_violation_count = int(
+                    record.fast_target_violation_count
+                )
+                self.records.sort(key=_candidate_record_rank)
             return
         self.records.append(
             CandidateRecord(
@@ -429,9 +477,16 @@ class CandidatePool:
                 fast_cost=float(record.fast_cost),
                 parameters=values.copy(),
                 global_timestep=int(record.global_timestep),
+                fast_target_pass=bool(record.fast_target_pass),
+                fast_maximum_target_violation=float(
+                    record.fast_maximum_target_violation
+                ),
+                fast_target_violation_count=int(
+                    record.fast_target_violation_count
+                ),
             )
         )
-        self.records.sort(key=lambda item: (item.fast_cost, item.global_timestep))
+        self.records.sort(key=_candidate_record_rank)
         del self.records[self.maximum_size :]
 
     def to_payload(self) -> list[dict[str, Any]]:
@@ -540,6 +595,13 @@ class CandidateCollectorCallback(BaseCallback):
                     fast_cost=float(info["stage_cost"]),
                     parameters=np.asarray(info["parameters"], dtype=np.float64),
                     global_timestep=first_timestep + rank,
+                    fast_target_pass=bool(info["stage_target_pass"]),
+                    fast_maximum_target_violation=float(
+                        info["stage_maximum_target_violation"]
+                    ),
+                    fast_target_violation_count=int(
+                        info["stage_target_violation_count"]
+                    ),
                 )
             )
         if self.progress_reporter is not None:
@@ -581,6 +643,50 @@ def _unique_parameter_sets(values: Iterable[np.ndarray]) -> list[np.ndarray]:
     return unique
 
 
+def _audit_rank(report: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Rank validity and six-metric feasibility before the original Cost."""
+
+    return (
+        not bool(report["safe"]),
+        not bool(report["target_pass"]),
+        float(report["maximum_target_violation"]),
+        int(report["target_violation_count"]),
+        float(report["cost"]),
+    )
+
+
+def _audit_improves(
+    candidate: Mapping[str, Any],
+    baseline: Mapping[str, Any],
+    minimum_cost_improvement: float,
+) -> bool:
+    """Accept a strict feasibility improvement or a material Cost improvement."""
+
+    if not bool(candidate["safe"]):
+        return False
+    if not bool(baseline["safe"]):
+        return True
+    candidate_pass = bool(candidate["target_pass"])
+    baseline_pass = bool(baseline["target_pass"])
+    if candidate_pass != baseline_pass:
+        return candidate_pass
+    tolerance = 1e-12
+    candidate_maximum = float(candidate["maximum_target_violation"])
+    baseline_maximum = float(baseline["maximum_target_violation"])
+    if candidate_maximum < baseline_maximum - tolerance:
+        return True
+    if candidate_maximum > baseline_maximum + tolerance:
+        return False
+    candidate_count = int(candidate["target_violation_count"])
+    baseline_count = int(baseline["target_violation_count"])
+    if candidate_count != baseline_count:
+        return candidate_count < baseline_count
+    return bool(
+        float(candidate["cost"])
+        < float(baseline["cost"]) - float(minimum_cost_improvement)
+    )
+
+
 def validate_candidate_pool(
     environment: PIDTuningEnv,
     stage: str,
@@ -604,7 +710,7 @@ def validate_candidate_pool(
         for parameters in candidates
     ]
     safe = [report for report in audits if report["safe"]]
-    selected = min(safe, key=lambda report: float(report["cost"])) if safe else None
+    selected = min(safe, key=_audit_rank) if safe else None
     return {
         "schema_version": 1,
         "backend": "physics",
@@ -612,6 +718,14 @@ def validate_candidate_pool(
         "validation_kind": "runtime_training_validation",
         "candidate_count": len(audits),
         "safe_candidate_count": len(safe),
+        "all_target_pass_candidate_count": sum(
+            bool(report["safe"] and report["target_pass"])
+            for report in audits
+        ),
+        "selection_policy": (
+            "numerical validity, all active-loop targets, maximum normalized "
+            "target violation, violation count, then original six-metric Cost"
+        ),
         "selected": selected,
         "candidates": audits,
     }
@@ -641,7 +755,7 @@ def select_stage_curriculum_parameters(
             for item in runtime["candidates"]
             if bool(item["safe"])
         ),
-        key=lambda item: float(item["cost"]),
+        key=_audit_rank,
     )
     finalist_values = _unique_parameter_sets(
         [
@@ -673,14 +787,14 @@ def select_stage_curriculum_parameters(
     )
     safe_finalists = [item for item in full_audits if bool(item["safe"])]
     best = (
-        min(safe_finalists, key=lambda item: float(item["cost"]))
+        min(safe_finalists, key=_audit_rank)
         if safe_finalists
         else baseline_audit
     )
-    accepted = bool(
-        best["safe"]
-        and float(best["cost"])
-        < float(baseline_audit["cost"]) - float(minimum_improvement)
+    accepted = _audit_improves(
+        best,
+        baseline_audit,
+        minimum_improvement,
     )
     selected = (
         np.asarray(best["parameters"], dtype=np.float64)
@@ -698,6 +812,10 @@ def select_stage_curriculum_parameters(
         "full_audit_finalists": full_audits,
         "baseline_full_audit": baseline_audit,
         "best_full_audit": best,
+        "selection_policy": (
+            "numerical validity and all active-loop targets precede original "
+            "six-metric Cost across the training and validation models present"
+        ),
         "accepted": accepted,
         "selected_parameters": selected.tolist(),
     }
@@ -809,6 +927,12 @@ def _save_resume_checkpoint(
             environment_states = model_environment.env_method("export_state")
             with (temporary / "environment_states.pkl").open("wb") as stream:
                 cloudpickle.dump(environment_states, stream)
+        sampling_saved = isinstance(model_environment, PlantSamplingVecEnv)
+        if sampling_saved:
+            _atomic_write_json(
+                temporary / "plant_sampler_state.json",
+                model_environment.export_sampling_state(),
+            )
         metadata = {
             "schema_version": TRAINING_PROTOCOL_SCHEMA_VERSION,
             "created_at_utc": utc_now(),
@@ -825,6 +949,7 @@ def _save_resume_checkpoint(
                 else getattr(model, "n_envs", 1)
             ),
             "environment_state_saved": model_environment is not None,
+            "plant_sampler_state_saved": sampling_saved,
         }
         _atomic_write_json(temporary / "checkpoint.json", metadata)
         (temporary / "COMPLETE").write_text("complete\n", encoding="utf-8")
@@ -836,6 +961,11 @@ def _save_resume_checkpoint(
     state["latest_checkpoint"] = target.relative_to(run_dir).as_posix()
     state["updated_at_utc"] = utc_now()
     _atomic_write_json(run_dir / "trainer_state.json", state)
+    if isinstance(model_environment, PlantSamplingVecEnv):
+        _atomic_write_json(
+            run_dir / "sampling" / f"{state['stage']}_summary.json",
+            model_environment.sampling_summary(),
+        )
     _prune_resume_checkpoints(
         checkpoint_root,
         keep_last=int(config.payload["checkpoint"]["keep_last"]),
@@ -946,6 +1076,11 @@ def _load_checkpoint(
                 environment_state,
                 indices=rank,
             )
+    if same_stage and isinstance(environment, PlantSamplingVecEnv):
+        sampler_path = checkpoint / "plant_sampler_state.json"
+        if not checkpoint_metadata.get("plant_sampler_state_saved") or not sampler_path.is_file():
+            raise ValueError("checkpoint is missing the required plant sampler state")
+        environment.restore_sampling_state(json.loads(sampler_path.read_text(encoding="utf-8")))
     model = SAC.load(
         checkpoint / "model.zip",
         env=environment,
@@ -1319,6 +1454,7 @@ def run_formal_training(
             "output_directory": str(output),
             "configuration_path": str(config.path),
             "configuration": config.payload,
+            "initial_parameters": initial_parameters.tolist(),
             "effective_stage_timesteps": effective_steps,
             "effective_sac": effective_sac,
             "effective_parallelism": {
@@ -1392,6 +1528,8 @@ def run_formal_training(
                 start_method=str(
                     config.payload["parallelism"]["start_method"]
                 ),
+                plant_sampling=PlantSamplingConfig.from_mapping(config.payload.get("plant_sampling")).as_dict(),
+                sampling_log_path=output / "sampling" / f"{stage}_episodes.jsonl",
             )
 
             if model is None:
@@ -1581,6 +1719,7 @@ def run_formal_training(
                     "stage_timesteps": completed,
                     "global_timesteps": int(model.num_timesteps),
                     "candidate_pool_size": len(pool.records),
+                    "plant_sampling": training_environment.sampling_summary(),
                 }
             )
             stage_report_path = output / (
@@ -1603,6 +1742,7 @@ def run_formal_training(
                     "accepted": bool(stage_report["accepted"]),
                     "report": stage_report_path.relative_to(output).as_posix(),
                     "model": final_model_path.relative_to(output).as_posix(),
+                    "plant_sampling": stage_report["plant_sampling"],
                 }
             )
             state["curriculum_parameters"] = selected.tolist()
@@ -1645,6 +1785,8 @@ def run_formal_training(
                 start_method=str(
                     config.payload["parallelism"]["start_method"]
                 ),
+                plant_sampling=PlantSamplingConfig.from_mapping(config.payload.get("plant_sampling")).as_dict(),
+                sampling_log_path=output / "sampling" / "joint_episodes.jsonl",
             )
             if int(state["global_timesteps_completed"]) <= 0:
                 raise RuntimeError(
@@ -1726,6 +1868,7 @@ def run_formal_training(
             "device": str(model.device),
             "total_timesteps": int(model.num_timesteps),
             "effective_stage_timesteps": effective_steps,
+            "plant_sampling": PlantSamplingConfig.from_mapping(config.payload.get("plant_sampling")).as_dict(),
             "candidate": candidate_path.relative_to(output).as_posix(),
             "candidate_valid_over_training_models": bool(final_audit["safe"]),
             "candidate_joint_cost": float(final_audit["cost"]),
@@ -1794,6 +1937,7 @@ def select_multi_seed_candidate(
     project_root: Path,
     candidate_paths: Iterable[Path],
     output_dir: Path,
+    config_path: Path | None = None,
 ) -> dict[str, Any]:
     root = Path(project_root).resolve()
     output = Path(output_dir).resolve()
@@ -1808,7 +1952,7 @@ def select_multi_seed_candidate(
     space = environment.parameter_space
     expected_input_fingerprint = build_training_input_manifest(
         root,
-        load_formal_training_config(root),
+        load_formal_training_config(root, config_path),
     )["fingerprint"]
     rows: list[dict[str, Any]] = []
     for raw_path in candidate_paths:
@@ -1850,6 +1994,11 @@ def select_multi_seed_candidate(
         )
         safe = bool(result["safe"])
         cost = float(result["cost"])
+        validation_cost = combined_stage_cost(
+            result["frequency"]["validation_diagnostics"],
+            result["time_domain"]["validation_diagnostics"],
+            "joint",
+        )
         audit = {
             "schema_version": 1,
             "backend": "physics",
@@ -1857,7 +2006,13 @@ def select_multi_seed_candidate(
             "seed": seed,
             "input_fingerprint": fingerprint,
             "safe": safe,
+            "target_pass": bool(result["target_pass"]),
+            "maximum_target_violation": float(
+                result["maximum_target_violation"]
+            ),
+            "target_violation_count": int(result["target_violation_count"]),
             "joint_cost": cost,
+            "validation_joint_cost": float(validation_cost),
             "parameter_names": list(space.names),
             "parameters": parameters.tolist(),
             "frequency": result["frequency"],
@@ -1873,7 +2028,15 @@ def select_multi_seed_candidate(
                 "candidate_sha256": sha256_file(path),
                 "input_fingerprint": fingerprint,
                 "safe": safe,
+                "target_pass": bool(result["target_pass"]),
+                "maximum_target_violation": float(
+                    result["maximum_target_violation"]
+                ),
+                "target_violation_count": int(
+                    result["target_violation_count"]
+                ),
                 "joint_cost": float(cost),
+                "validation_joint_cost": float(validation_cost),
                 "parameters": parameters.tolist(),
                 "audit": audit_path.relative_to(output).as_posix(),
             }
@@ -1889,11 +2052,17 @@ def select_multi_seed_candidate(
         raise ValueError("candidate runs used different training inputs")
     safe_rows = [row for row in rows if row["safe"]]
     if not safe_rows:
-        raise RuntimeError("no candidate is numerically valid over the training models")
+        raise RuntimeError(
+            "no candidate is numerically valid over the training and validation models"
+        )
     ranked = sorted(
         rows,
         key=lambda row: (
             not bool(row["safe"]),
+            not bool(row["target_pass"]),
+            float(row["maximum_target_violation"]),
+            int(row["target_violation_count"]),
+            float(row["validation_joint_cost"]),
             float(row["joint_cost"]),
             int(row["seed"]),
         ),
@@ -1913,21 +2082,43 @@ def select_multi_seed_candidate(
             TRAINING_PROTOCOL_SCHEMA_VERSION, dtype=np.int64
         ),
         valid_over_training_models=np.asarray(True),
+        valid_over_validation_models=np.asarray(True),
+        all_training_validation_targets_met=np.asarray(
+            selected["target_pass"]
+        ),
+        maximum_target_violation=np.asarray(
+            selected["maximum_target_violation"], dtype=np.float64
+        ),
+        target_violation_count=np.asarray(
+            selected["target_violation_count"], dtype=np.int64
+        ),
     )
     leaderboard = {
         "schema_version": 1,
         "backend": "physics",
         "selection_policy": (
-            "numerical validity over the 40 training models, then minimum "
-            "training-role joint six-metric cost; the 16 validation models "
-            "are reported separately and do not affect ranking"
+            "numerical validity and all six targets over the 40 training and "
+            "16 validation models, then minimum maximum normalized target "
+            "violation, violation count, validation joint Cost and training "
+            "joint Cost"
         ),
         "candidate_count": len(rows),
         "safe_candidate_count": len(safe_rows),
+        "all_target_pass_candidate_count": sum(
+            bool(row["safe"] and row["target_pass"]) for row in rows
+        ),
         "ranking": ranked,
         "selected_seed": selected["seed"],
         "selected_source_candidate": selected["candidate"],
         "selected_joint_cost": selected["joint_cost"],
+        "selected_validation_joint_cost": selected["validation_joint_cost"],
+        "selected_target_pass": selected["target_pass"],
+        "selected_maximum_target_violation": selected[
+            "maximum_target_violation"
+        ],
+        "selected_target_violation_count": selected[
+            "target_violation_count"
+        ],
         "final_candidate": final_candidate.name,
         "created_at_utc": utc_now(),
         "hardware_use_allowed": False,

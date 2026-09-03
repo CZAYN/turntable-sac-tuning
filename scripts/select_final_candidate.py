@@ -25,6 +25,7 @@ def main() -> int:
     parser.add_argument("--project-root", type=Path, default=PROJECT_ROOT)
     parser.add_argument("--runs-root", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--config", type=Path, default=None)
     parser.add_argument("candidates", nargs="*", type=Path)
     arguments = parser.parse_args()
 
@@ -50,6 +51,7 @@ def main() -> int:
         project_root,
         candidates,
         output_dir,
+        arguments.config,
     )
     print(
         json.dumps(
@@ -58,6 +60,10 @@ def main() -> int:
                 "safe_candidate_count": result["safe_candidate_count"],
                 "selected_seed": result["selected_seed"],
                 "selected_joint_cost": result["selected_joint_cost"],
+                "selected_validation_joint_cost": result[
+                    "selected_validation_joint_cost"
+                ],
+                "selected_target_pass": result["selected_target_pass"],
                 "final_candidate": str(output_dir / result["final_candidate"]),
             },
             ensure_ascii=False,

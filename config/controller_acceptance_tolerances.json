@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "description": "Per-loop closed-loop bandwidth acceptance tolerances shared by training candidate selection, validation reporting, and the next sealed final-test protocol. Cost and Reward continue to optimize the nominal bandwidth targets.",
+  "loops": {
+    "current": {
+      "bandwidth_tolerance_fraction": 0.1
+    },
+    "speed": {
+      "bandwidth_tolerance_fraction": 0.2
+    },
+    "position": {
+      "bandwidth_tolerance_fraction": 0.1
+    }
+  }
+}

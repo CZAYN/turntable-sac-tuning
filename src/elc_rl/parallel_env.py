@@ -5,11 +5,15 @@ from __future__ import annotations
 from functools import partial
 import os
 from pathlib import Path
+from typing import Any, Mapping
 
 import numpy as np
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnv
 
 from .tuning_env import PIDTuningEnv
+from .plant_sampling import PlantSamplingConfig, StagePlantSampler
+from .sampling_vec_env import PlantSamplingVecEnv
+from .physics_evaluator import get_physics_controller_evaluator
 
 
 def configure_thread_limits(thread_count: int = 1) -> None:
@@ -68,6 +72,8 @@ def create_training_vec_env(
     n_envs: int,
     stage_seed: int,
     start_method: str,
+    plant_sampling: Mapping[str, Any] | None = None,
+    sampling_log_path: Path | None = None,
 ) -> VecEnv:
     """Create seeded CPU workers for one SAC learner."""
 
@@ -96,5 +102,12 @@ def create_training_vec_env(
             factories,
             start_method=resolve_start_method(start_method),
         )
+    if plant_sampling is not None:
+        evaluator = get_physics_controller_evaluator(Path(root))
+        sampler = StagePlantSampler(
+            evaluator.model_ids(evaluator.training_indices), stage,
+            PlantSamplingConfig.from_mapping(plant_sampling),
+        )
+        environment = PlantSamplingVecEnv(environment, sampler, sampling_log_path)
     environment.seed(int(stage_seed))
     return environment
