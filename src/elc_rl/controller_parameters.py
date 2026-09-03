@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 from pathlib import Path
@@ -34,6 +34,9 @@ PARAMETER_ORDER = (
 
 PHYSICS_PARAMETER_SPACE_JSON = "controller_parameter_space.json"
 PHYSICS_PARAMETER_SPACE_NPZ = "controller_parameter_space.npz"
+PHYSICS_TRAINING_ANCHOR_RELATIVE_PATH = Path(
+    "data/processed/training_anchor.json"
+)
 _BOUNDARY_EPS_FACTOR = 128.0
 _FEASIBILITY_BOUND_MARGIN_FRACTION = 0.05
 _CURRENT_EVIDENCE_SELECTION_GROUPS = (
@@ -206,6 +209,142 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _parameter_vector_sha256(parameters: np.ndarray) -> str:
+    values = np.asarray(parameters, dtype="<f8")
+    return hashlib.sha256(values.tobytes(order="C")).hexdigest()
+
+
+def load_physics_training_anchor(project_root: Path) -> dict[str, Any]:
+    """Load and validate the optional formal-training initialization anchor.
+
+    The anchor is deliberately separate from the controller parameter-space
+    artifact.  Training packages include it, while the sealed final-test
+    package does not depend on it.
+    """
+
+    root = Path(project_root).resolve()
+    path = root / PHYSICS_TRAINING_ANCHOR_RELATIVE_PATH
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if int(payload.get("schema_version", 0)) != 1:
+        raise ValueError("training anchor has an unsupported schema version")
+    if payload.get("backend") != "physics":
+        raise ValueError("training anchor is not for the physics backend")
+    if payload.get("task_id") != PHYSICS_TASK_ID:
+        raise ValueError("training anchor task_id does not match the controller task")
+    if payload.get("purpose") != "formal_training_initialization_only":
+        raise ValueError("training anchor has an invalid purpose")
+    if tuple(payload.get("parameter_order", ())) != PARAMETER_ORDER:
+        raise ValueError("training anchor parameter order does not match the controller")
+    if payload.get("parameter_vector_encoding") != "little_endian_float64_c_order":
+        raise ValueError("training anchor has an unsupported vector encoding")
+
+    parameters = np.asarray(payload.get("parameters", ()), dtype=np.float64)
+    if parameters.shape != (len(PARAMETER_ORDER),):
+        raise ValueError("training anchor must contain exactly 11 parameters")
+    if not np.isfinite(parameters).all():
+        raise ValueError("training anchor contains non-finite parameters")
+    actual_vector_sha256 = _parameter_vector_sha256(parameters)
+    if payload.get("parameter_vector_sha256") != actual_vector_sha256:
+        raise ValueError("training anchor parameter-vector SHA256 does not match")
+
+    provenance = payload.get("provenance", {})
+    selection_models = provenance.get("selection_models", {})
+    if selection_models != {"training": 40, "validation": 0, "sealed_test": 0}:
+        raise ValueError("training anchor provenance violates model isolation")
+    if provenance.get("full_three_loop_six_metric_audit_executed") is not False:
+        raise ValueError("training anchor must not claim a completed formal audit")
+    for key in ("selected_report", "upstream_dobc_report"):
+        source = provenance.get(key, {})
+        digest = str(source.get("sha256", ""))
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            raise ValueError(f"training anchor {key} lacks a lowercase SHA256")
+        if source.get("included_in_server_package") is not False:
+            raise ValueError(f"training anchor {key} must remain provenance-only")
+
+    acceptance = payload.get("acceptance", {})
+    if acceptance.get("status") != "engineering_initialization_only":
+        raise ValueError("training anchor acceptance status is invalid")
+    if acceptance.get("passed_all_three_loops_six_metrics") is not False:
+        raise ValueError("training anchor must not claim final metric acceptance")
+    if acceptance.get("eligible_as_final_candidate") is not False:
+        raise ValueError("training anchor must not be eligible as a final candidate")
+    if payload.get("hardware_use_allowed") is not False:
+        raise ValueError("training anchor must remain simulation-only")
+
+    return {
+        **payload,
+        "path": str(PHYSICS_TRAINING_ANCHOR_RELATIVE_PATH).replace("\\", "/"),
+        "file_sha256": _sha256(path),
+        "parameters_array": parameters,
+    }
+
+
+def _with_optional_training_anchor(
+    space: ControllerParameterSpace,
+    project_root: Path,
+) -> ControllerParameterSpace:
+    root = Path(project_root).resolve()
+    path = root / PHYSICS_TRAINING_ANCHOR_RELATIVE_PATH
+    if not path.is_file():
+        return space
+
+    anchor = load_physics_training_anchor(root)
+    parameters = np.asarray(anchor["parameters_array"], dtype=np.float64)
+    tolerance = np.asarray(
+        [
+            _physical_boundary_tolerance(spec.lower, spec.upper)
+            for spec in space.specs
+        ],
+        dtype=np.float64,
+    )
+    if np.any(parameters < space.lower - tolerance) or np.any(
+        parameters > space.upper + tolerance
+    ):
+        raise ValueError("training anchor contains a parameter outside formal bounds")
+    parameters = np.clip(parameters, space.lower, space.upper)
+
+    source = (
+        f"formal training initialization anchor {anchor['path']} "
+        f"(vector SHA256 {anchor['parameter_vector_sha256']}); not an acceptance result"
+    )
+    specs = []
+    for spec, initial in zip(space.specs, parameters, strict=True):
+        digital_initial = None
+        if spec.sample_period_s is not None and spec.module in {
+            "current",
+            "speed",
+            "position",
+        }:
+            digital_initial = _digital_value(spec.name, float(initial), spec.sample_period_s)
+        specs.append(
+            replace(
+                spec,
+                initial=float(initial),
+                digital_initial=digital_initial,
+                source_kind="formal_training_anchor",
+                source=source,
+            )
+        )
+    metadata = {
+        **space.metadata,
+        "training_anchor": {
+            "path": anchor["path"],
+            "file_sha256": anchor["file_sha256"],
+            "parameter_vector_sha256": anchor["parameter_vector_sha256"],
+            "purpose": anchor["purpose"],
+            "acceptance_status": anchor["acceptance"]["status"],
+            "eligible_as_final_candidate": False,
+        },
+    }
+    anchored = ControllerParameterSpace(
+        task_id=space.task_id,
+        specs=tuple(specs),
+        metadata=metadata,
+    )
+    anchored.validate()
+    return anchored
 
 
 def _sample_period_for_module(config: Any, module: str) -> float | None:
@@ -766,4 +905,4 @@ def load_physics_controller_parameter_space(
         )
     space = _space_from_payload(payload)
     space.validate()
-    return space
+    return _with_optional_training_anchor(space, project_root)

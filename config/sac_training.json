@@ -27,6 +27,17 @@
       "total_timesteps": 120000
     }
   ],
+  "plant_sampling": {
+    "mode": "difficulty",
+    "uniform_fraction": 0.3,
+    "warmup_episodes_per_model": 2,
+    "ema_rate": 0.1,
+    "cost_clip": 100,
+    "margin_clip": 10,
+    "score_floor": 0.05,
+    "hardness_exponent": 1,
+    "maximum_probability": 0.1
+  },
   "environment": {
     "max_episode_steps": 32,
     "audit_interval": 64,

@@ -5,7 +5,7 @@ from __future__ import annotations
 from functools import lru_cache
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import numpy as np
 
@@ -26,6 +26,7 @@ from .performance_targets import (
     aggregate_loop_costs,
     aggregate_model_costs,
     frequency_normalized_errors,
+    frequency_target_violations,
     load_controller_performance_targets,
     metric_cost,
     time_normalized_errors,
@@ -273,6 +274,22 @@ def _frequency_grid(loop: str, points: int) -> np.ndarray:
     return grid
 
 
+def _classical_phase_margin_deg(phase_at_gain_crossing_deg: float) -> float:
+    """Return phase margin on the conventional (-180, 180] degree branch.
+
+    ``np.unwrap`` is useful for locating phase crossings, but its result can
+    differ by an integer number of turns.  A position loop can therefore have
+    a gain-crossover phase near +257 degrees instead of the equivalent
+    -103 degrees.  Normalize only the gain-crossover phase used for phase
+    margin; the unwrapped trace remains available for gain-margin crossings.
+    """
+
+    phase_deg = float(np.mod(phase_at_gain_crossing_deg, 360.0))
+    if phase_deg > 0.0:
+        phase_deg -= 360.0
+    return float(180.0 + phase_deg)
+
+
 def _evaluate_open_loop(
     loop: str,
     model: DiscreteLoopModel,
@@ -299,7 +316,9 @@ def _evaluate_open_loop(
     if gain_crossings:
         phase_margin_deg = float(
             min(
-                180.0 + interpolate_pair(phase_deg, index, fraction)
+                _classical_phase_margin_deg(
+                    interpolate_pair(phase_deg, index, fraction)
+                )
                 for _, index, fraction in gain_crossings
             )
         )
@@ -376,8 +395,30 @@ def _physics_split(loop: str, role: str) -> str:
     }[loop]
 
 
+def _validated_loops(loops: Iterable[str] | None) -> tuple[str, ...]:
+    selected = LOOP_ORDER if loops is None else tuple(str(loop) for loop in loops)
+    if not selected or len(set(selected)) != len(selected):
+        raise ValueError("evaluation loops must be a non-empty unique sequence")
+    if any(loop not in LOOP_ORDER for loop in selected):
+        raise ValueError(f"evaluation loops must be drawn from {LOOP_ORDER}")
+    return tuple(loop for loop in LOOP_ORDER if loop in selected)
+
+
+def _aggregate_selected_loop_costs(
+    loop_costs: dict[str, float], settings: Any
+) -> float:
+    if tuple(loop_costs) == LOOP_ORDER:
+        return aggregate_loop_costs(loop_costs, settings)
+    values = tuple(float(value) for value in loop_costs.values())
+    return float(
+        np.mean(values) + settings.joint_worst_loop_weight * np.max(values)
+    )
+
+
 def _frequency_performance(
-    rows: list[dict[str, Any]], targets: Any
+    rows: list[dict[str, Any]],
+    targets: Any,
+    loops: Iterable[str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     """Build the frequency half of the literal six-metric objective."""
 
@@ -385,13 +426,15 @@ def _frequency_performance(
     performance: dict[str, Any] = {}
     loop_costs: dict[str, float] = {}
     loop_validity: dict[str, bool] = {}
-    for loop in LOOP_ORDER:
+    selected_loops = _validated_loops(loops)
+    for loop in selected_loops:
         loop_rows = [row for row in rows if row["loop"] == loop]
         if not loop_rows:
             raise ValueError(f"frequency evaluation has no {loop} rows")
         target = targets.loop(loop)
         row_costs: list[float] = []
         row_errors: list[dict[str, float]] = []
+        row_violations: list[dict[str, float]] = []
         for row in loop_rows:
             errors = frequency_normalized_errors(
                 bandwidth_hz=float(row["bandwidth_hz"]),
@@ -402,9 +445,23 @@ def _frequency_performance(
                 invalid_error=settings.invalid_normalized_error,
             )
             cost = metric_cost(errors, FREQUENCY_ERROR_ORDER, delta=settings.huber_delta)
+            violations = frequency_target_violations(
+                bandwidth_hz=float(row["bandwidth_hz"]),
+                gain_margin_db=float(row["gain_margin_db"]),
+                phase_margin_deg=float(row["phase_margin_deg"]),
+                target=target,
+                invalid_error=settings.invalid_normalized_error,
+            )
+            if not bool(row["metric_valid"]):
+                violations = {
+                    name: float(settings.invalid_normalized_error)
+                    for name in FREQUENCY_ERROR_ORDER
+                }
             row["normalized_errors"] = errors
+            row["target_violations"] = violations
             row["frequency_cost"] = cost
             row_errors.append(errors)
+            row_violations.append(violations)
             row_costs.append(cost)
         bandwidth_errors = np.asarray(
             [errors["bandwidth"] for errors in row_errors], dtype=np.float64
@@ -421,18 +478,18 @@ def _frequency_performance(
                 max(errors["phase_margin"] for errors in row_errors)
             ),
         }
-        valid = bool(all(bool(row["metric_valid"]) for row in loop_rows))
-        target_pass = bool(
-            valid
-            and all(
-                abs(float(row["bandwidth_hz"]) / target.bandwidth_hz - 1.0)
-                <= settings.bandwidth_relative_scale
-                and float(row["gain_margin_db"]) >= target.minimum_gain_margin_db
-                and float(row["phase_margin_deg"])
-                >= target.minimum_phase_margin_deg
-                for row in loop_rows
+        target_violations = {
+            name: float(max(violations[name] for violations in row_violations))
+            for name in FREQUENCY_ERROR_ORDER
+        }
+        target_violation_model_count = int(
+            sum(
+                any(float(value) > 0.0 for value in violations.values())
+                for violations in row_violations
             )
         )
+        valid = bool(all(bool(row["metric_valid"]) for row in loop_rows))
+        target_pass = bool(valid and target_violation_model_count == 0)
         loop_cost = aggregate_model_costs(row_costs, settings)
         loop_costs[loop] = loop_cost
         loop_validity[loop] = valid
@@ -450,11 +507,13 @@ def _frequency_performance(
                 ),
             },
             "normalized_errors": normalized_errors,
+            "target_violations": target_violations,
+            "target_violation_model_count": target_violation_model_count,
             "frequency_cost": loop_cost,
             "valid": valid,
             "target_pass": target_pass,
         }
-    frequency_total = aggregate_loop_costs(loop_costs, settings)
+    frequency_total = _aggregate_selected_loop_costs(loop_costs, settings)
     cost = {
         "loops": dict(loop_costs),
         "frequency_total": frequency_total,
@@ -465,7 +524,7 @@ def _frequency_performance(
         "frequency_metrics_valid": bool(all(loop_validity.values())),
         "loop_validity": loop_validity,
         "all_frequency_targets_met": bool(
-            all(performance[loop]["target_pass"] for loop in LOOP_ORDER)
+            all(performance[loop]["target_pass"] for loop in selected_loops)
         ),
     }
     return performance, cost, safety
@@ -600,7 +659,9 @@ class PhysicsControllerEvaluator:
         frequency_points: int,
         mode: str,
         include_models: bool,
+        loops: Iterable[str] | None = None,
     ) -> dict[str, Any]:
+        selected_loops = _validated_loops(loops)
         values = np.asarray(parameters, dtype=np.float64)
         self.space.normalize(values)
         rows: list[dict[str, Any]] = []
@@ -609,7 +670,7 @@ class PhysicsControllerEvaluator:
             motor = self.motor(index)
             models = build_discrete_loop_models(self.config, motor, values)
             role = str(self.ensemble["role"][index])
-            for loop in LOOP_ORDER:
+            for loop in selected_loops:
                 split = _physics_split(loop, role)
                 row: dict[str, Any] = {
                     "model_id": str(self.ensemble["model_id"][index]),
@@ -626,7 +687,7 @@ class PhysicsControllerEvaluator:
         training_rows = [row for row in rows if row["role"] != "validation"]
         validation_rows = [row for row in rows if row["role"] == "validation"]
         performance, cost, safety = _frequency_performance(
-            training_rows, self.performance_targets
+            training_rows, self.performance_targets, selected_loops
         )
         validation_diagnostics = None
         if validation_rows:
@@ -634,7 +695,9 @@ class PhysicsControllerEvaluator:
                 validation_performance,
                 validation_cost,
                 validation_safety,
-            ) = _frequency_performance(validation_rows, self.performance_targets)
+            ) = _frequency_performance(
+                validation_rows, self.performance_targets, selected_loops
+            )
             validation_diagnostics = {
                 "performance_metrics": validation_performance,
                 "cost": validation_cost,
@@ -654,6 +717,7 @@ class PhysicsControllerEvaluator:
             "parameters": values.tolist(),
             "evaluated_model_count": int(len(indices)),
             "evaluated_model_ids": list(self.model_ids(indices)),
+            "evaluated_loops": list(selected_loops),
             "performance_targets": self.performance_targets.as_dict(),
             "performance_metrics": performance,
             "cost": cost,
@@ -690,6 +754,7 @@ class PhysicsControllerEvaluator:
                     "bandwidth_found": row["bandwidth_found"],
                     "metric_valid": row["metric_valid"],
                     "normalized_errors": row["normalized_errors"],
+                    "target_violations": row["target_violations"],
                     "frequency_cost": row["frequency_cost"],
                 }
                 for row in rows
@@ -704,6 +769,7 @@ class PhysicsControllerEvaluator:
         sampled_indices: np.ndarray,
         *,
         include_models: bool = False,
+        loops: Iterable[str] | None = None,
     ) -> dict[str, Any]:
         indices = self.validate_sampled_indices(sampled_indices)
         return self._evaluate(
@@ -712,10 +778,15 @@ class PhysicsControllerEvaluator:
             frequency_points=PHYSICS_TRAIN_FREQUENCY_POINTS,
             mode="train",
             include_models=include_models,
+            loops=loops,
         )
 
     def audit(
-        self, parameters: np.ndarray, *, include_models: bool = False
+        self,
+        parameters: np.ndarray,
+        *,
+        include_models: bool = False,
+        loops: Iterable[str] | None = None,
     ) -> dict[str, Any]:
         return self._evaluate(
             parameters,
@@ -723,6 +794,25 @@ class PhysicsControllerEvaluator:
             frequency_points=PHYSICS_FREQUENCY_POINTS,
             mode="audit",
             include_models=include_models,
+            loops=loops,
+        )
+
+    def training_audit(
+        self,
+        parameters: np.ndarray,
+        *,
+        include_models: bool = False,
+        loops: Iterable[str] | None = None,
+    ) -> dict[str, Any]:
+        """Audit only the 40 training-role models at production resolution."""
+
+        return self._evaluate(
+            parameters,
+            self.training_indices,
+            frequency_points=PHYSICS_FREQUENCY_POINTS,
+            mode="training_audit",
+            include_models=include_models,
+            loops=loops,
         )
 
 
@@ -766,7 +856,9 @@ def _reference_metrics(trace: SimulationTrace) -> dict[str, float | bool]:
 
 
 def _time_performance(
-    rows: list[dict[str, Any]], targets: Any
+    rows: list[dict[str, Any]],
+    targets: Any,
+    loops: Iterable[str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     """Build the time half of the literal six-metric objective."""
 
@@ -774,13 +866,15 @@ def _time_performance(
     performance: dict[str, Any] = {}
     loop_costs: dict[str, float] = {}
     loop_validity: dict[str, bool] = {}
-    for loop in LOOP_ORDER:
+    selected_loops = _validated_loops(loops)
+    for loop in selected_loops:
         loop_rows = [row for row in rows if row["loop"] == loop]
         if not loop_rows:
             raise ValueError(f"time-domain evaluation has no {loop} rows")
         target = targets.loop(loop)
         row_costs: list[float] = []
         row_errors: list[dict[str, float]] = []
+        row_violations: list[dict[str, float]] = []
         for row in loop_rows:
             errors = time_normalized_errors(
                 overshoot_ratio=float(row["overshoot_ratio"]),
@@ -790,14 +884,43 @@ def _time_performance(
                 invalid_error=settings.invalid_normalized_error,
             )
             cost = metric_cost(errors, TIME_ERROR_ORDER, delta=settings.huber_delta)
+            violations = dict(errors)
+            if not bool(row["time_domain_stable"]) or not bool(
+                row["reference_metric_valid"]
+            ):
+                violations = {
+                    name: float(settings.invalid_normalized_error)
+                    for name in TIME_ERROR_ORDER
+                }
+            else:
+                if not bool(row["reached_90_percent"]):
+                    violations["rise_time"] = float(
+                        settings.invalid_normalized_error
+                    )
+                if not bool(row["settled"]):
+                    violations["settling_time"] = float(
+                        settings.invalid_normalized_error
+                    )
             row["normalized_errors"] = errors
+            row["target_violations"] = violations
             row["time_cost"] = cost
             row_errors.append(errors)
+            row_violations.append(violations)
             row_costs.append(cost)
         normalized_errors = {
             name: float(max(errors[name] for errors in row_errors))
             for name in TIME_ERROR_ORDER
         }
+        target_violations = {
+            name: float(max(violations[name] for violations in row_violations))
+            for name in TIME_ERROR_ORDER
+        }
+        target_violation_model_count = int(
+            sum(
+                any(float(value) > 0.0 for value in violations.values())
+                for violations in row_violations
+            )
+        )
         valid = bool(
             all(
                 bool(row["time_domain_stable"])
@@ -805,19 +928,7 @@ def _time_performance(
                 for row in loop_rows
             )
         )
-        target_pass = bool(
-            valid
-            and all(
-                bool(row["reached_90_percent"])
-                and bool(row["settled"])
-                and float(row["overshoot_ratio"])
-                <= target.maximum_overshoot_ratio
-                and float(row["rise_time_s"]) <= target.maximum_rise_time_s
-                and float(row["settling_time_s"])
-                <= target.maximum_settling_time_s
-                for row in loop_rows
-            )
-        )
+        target_pass = bool(valid and target_violation_model_count == 0)
         loop_cost = aggregate_model_costs(row_costs, settings)
         loop_costs[loop] = loop_cost
         loop_validity[loop] = valid
@@ -835,11 +946,13 @@ def _time_performance(
                 ),
             },
             "normalized_errors": normalized_errors,
+            "target_violations": target_violations,
+            "target_violation_model_count": target_violation_model_count,
             "time_cost": loop_cost,
             "valid": valid,
             "target_pass": target_pass,
         }
-    time_total = aggregate_loop_costs(loop_costs, settings)
+    time_total = _aggregate_selected_loop_costs(loop_costs, settings)
     cost = {
         "loops": dict(loop_costs),
         "time_total": time_total,
@@ -849,7 +962,7 @@ def _time_performance(
         "time_metrics_valid": bool(all(loop_validity.values())),
         "loop_validity": loop_validity,
         "all_time_targets_met": bool(
-            all(performance[loop]["target_pass"] for loop in LOOP_ORDER)
+            all(performance[loop]["target_pass"] for loop in selected_loops)
         ),
     }
     return performance, cost, safety
@@ -990,6 +1103,7 @@ class PhysicsTimeDomainEvaluator:
                     "reference_metric_valid": row["reference_metric_valid"],
                     "time_domain_stable": row["time_domain_stable"],
                     "normalized_errors": row["normalized_errors"],
+                    "target_violations": row["target_violations"],
                     "time_cost": row["time_cost"],
                 }
                 for row in rows

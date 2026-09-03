@@ -149,6 +149,56 @@ def _report_valid(report: dict[str, Any]) -> bool:
     return bool(metrics_valid and safety_valid)
 
 
+def _report_valid_including_validation(report: dict[str, Any]) -> bool:
+    """Return validity across every training and validation split present."""
+
+    if not _report_valid(report):
+        return False
+    validation_valid = report.get("safety", {}).get("validation_metrics_valid")
+    return bool(validation_valid is None or validation_valid)
+
+
+def stage_target_summary(
+    frequency_report: dict[str, Any],
+    time_report: dict[str, Any],
+    stage: str,
+) -> dict[str, Any]:
+    """Summarize six-metric acceptance over every evaluated model split."""
+
+    if stage not in STAGE_ORDER:
+        raise ValueError(f"invalid target-summary stage: {stage}")
+    active_loops = LOOP_ORDER if stage == "joint" else (stage,)
+    split_pairs = [(frequency_report, time_report)]
+    frequency_validation = frequency_report.get("validation_diagnostics")
+    time_validation = time_report.get("validation_diagnostics")
+    if (frequency_validation is None) != (time_validation is None):
+        raise ValueError("frequency/time validation diagnostics do not match")
+    if frequency_validation is not None and time_validation is not None:
+        split_pairs.append((frequency_validation, time_validation))
+
+    maximum_violation = 0.0
+    violation_count = 0
+    target_pass = True
+    for frequency_split, time_split in split_pairs:
+        for loop in active_loops:
+            for report in (frequency_split, time_split):
+                metrics = report["performance_metrics"][loop]
+                target_pass = bool(target_pass and metrics["target_pass"])
+                violations = metrics["target_violations"]
+                maximum_violation = max(
+                    maximum_violation,
+                    *(max(0.0, float(value)) for value in violations.values()),
+                )
+                violation_count += int(metrics["target_violation_model_count"])
+    return {
+        "target_pass": bool(target_pass and violation_count == 0),
+        "maximum_target_violation": float(maximum_violation),
+        "target_violation_count": int(violation_count),
+        "evaluated_splits": len(split_pairs),
+        "evaluated_loops": list(active_loops),
+    }
+
+
 class PIDTuningEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
     """Bounded delta-action environment with periodic full-ensemble audits."""
 
@@ -244,6 +294,8 @@ class PIDTuningEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         self._step_count = 0
         self._total_step_count = 0
         self._episode_count = 0
+        self._plant_sampling_probabilities: np.ndarray | None = None
+        self._sampled_model_probability = 1.0 / len(self.evaluator.training_indices)
 
     @property
     def parameters(self) -> np.ndarray:
@@ -278,12 +330,19 @@ class PIDTuningEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             else self.time_evaluator.audit(candidate)
         )
         valid = bool(
-            _report_valid(frequency_report) and _report_valid(time_report)
+            _report_valid_including_validation(frequency_report)
+            and _report_valid_including_validation(time_report)
+        )
+        target_summary = stage_target_summary(
+            frequency_report,
+            time_report,
+            self.stage,
         )
         return {
             "safe": valid,
             "valid": valid,
             "cost": combined_stage_cost(frequency_report, time_report, self.stage),
+            **target_summary,
             "frequency": frequency_report,
             "time_domain": time_report,
             "parameters": candidate.copy(),
@@ -338,12 +397,16 @@ class PIDTuningEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         fast_frequency_valid = _report_valid(self._report)
         fast_time_valid = _report_valid(self._time_report)
         fast_valid = bool(fast_frequency_valid and fast_time_valid)
-        target_pass = bool(
-            all(
-                self._report["performance_metrics"][loop]["target_pass"]
-                and self._time_report["performance_metrics"][loop]["target_pass"]
-                for loop in LOOP_ORDER
-            )
+        active_loops = LOOP_ORDER if self.stage == "joint" else (self.stage,)
+        margin_violation = max(
+            max(0.0, float(self._report["performance_metrics"][loop]["normalized_errors"][metric]))
+            for loop in active_loops
+            for metric in ("gain_margin", "phase_margin")
+        )
+        target_summary = stage_target_summary(
+            self._report,
+            self._time_report,
+            self.stage,
         )
         return {
             "backend": self.backend,
@@ -352,6 +415,7 @@ class PIDTuningEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             "step": self._step_count,
             "total_step": self._total_step_count,
             "stage_cost": float(total_cost),
+            "stage_margin_violation": float(margin_violation),
             "frequency_stage_cost": float(frequency_cost),
             "time_stage_cost": float(time_cost),
             "fast_valid": fast_valid,
@@ -361,7 +425,14 @@ class PIDTuningEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             "fast_safe": fast_valid,
             "fast_frequency_safe": fast_frequency_valid,
             "fast_time_safe": fast_time_valid,
-            "target_pass": target_pass,
+            "target_pass": target_summary["target_pass"],
+            "stage_target_pass": target_summary["target_pass"],
+            "stage_maximum_target_violation": target_summary[
+                "maximum_target_violation"
+            ],
+            "stage_target_violation_count": target_summary[
+                "target_violation_count"
+            ],
             "audit_performed": audit_performed,
             "audit_valid": (
                 None
@@ -378,6 +449,7 @@ class PIDTuningEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             "audit_frequency_safe": audit_frequency_valid,
             "audit_time_safe": audit_time_valid,
             "sampled_model_ids": self.evaluator.model_ids(self._sampled_indices),
+            "sampled_model_probability": float(self._sampled_model_probability),
             "parameters": self._parameters.copy(),
         }
 
@@ -400,6 +472,22 @@ class PIDTuningEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             )
         return self.parameter_space.denormalize(normalized)
 
+    def set_plant_sampling_probabilities(self, probabilities: np.ndarray | None) -> None:
+        """Set weights in training-index order; validation indices are never eligible."""
+
+        if probabilities is None:
+            self._plant_sampling_probabilities = None
+            return
+        values = np.asarray(probabilities, dtype=np.float64)
+        if (
+            values.shape != self.evaluator.training_indices.shape
+            or not np.isfinite(values).all()
+            or np.any(values <= 0.0)
+            or not np.isclose(values.sum(), 1.0, atol=1e-12, rtol=0.0)
+        ):
+            raise ValueError("plant probabilities must be positive and sum to one over training models")
+        self._plant_sampling_probabilities = values.copy()
+
     def reset(
         self,
         *,
@@ -421,11 +509,24 @@ class PIDTuningEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         )
         explicit_indices = options.get("sampled_indices")
         if explicit_indices is None:
-            self._sampled_indices = self.evaluator.sample_training_indices(self.np_random)
+            if self._plant_sampling_probabilities is None:
+                self._sampled_indices = self.evaluator.sample_training_indices(self.np_random)
+            else:
+                index = self.np_random.choice(
+                    self.evaluator.training_indices, p=self._plant_sampling_probabilities
+                )
+                self._sampled_indices = np.asarray([index], dtype=np.int64)
         else:
             self._sampled_indices = self.evaluator.validate_sampled_indices(
                 np.asarray(explicit_indices, dtype=np.int64)
             )
+
+        selected_offset = int(np.flatnonzero(self.evaluator.training_indices == self._sampled_indices[0])[0])
+        self._sampled_model_probability = (
+            1.0 / len(self.evaluator.training_indices)
+            if self._plant_sampling_probabilities is None
+            else float(self._plant_sampling_probabilities[selected_offset])
+        )
 
         candidate = self._candidate_initial_parameters(perturb, explicit)
         report = self.evaluator.train(candidate, self._sampled_indices)
@@ -479,7 +580,7 @@ class PIDTuningEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         ):
             raise RuntimeError("environment must be reset before exporting state")
         return {
-            "schema_version": 4,
+            "schema_version": 6,
             "stage": self.stage,
             "worker_rank": self.worker_rank,
             "parameters": self._parameters.copy(),
@@ -496,6 +597,11 @@ class PIDTuningEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
             "step_count": int(self._step_count),
             "total_step_count": int(self._total_step_count),
             "episode_count": int(self._episode_count),
+            "plant_sampling_probabilities": (
+                None if self._plant_sampling_probabilities is None
+                else self._plant_sampling_probabilities.copy()
+            ),
+            "sampled_model_probability": float(self._sampled_model_probability),
             "np_random_state": copy.deepcopy(self.np_random.bit_generator.state),
             "action_space_random_state": copy.deepcopy(
                 self.action_space.np_random.bit_generator.state
@@ -505,7 +611,7 @@ class PIDTuningEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
     def restore_state(self, state: dict[str, Any]) -> None:
         """Restore a state produced by :meth:`export_state`."""
 
-        if int(state.get("schema_version", -1)) != 4:
+        if int(state.get("schema_version", -1)) != 6:
             raise ValueError("unsupported environment state schema")
         if state.get("stage") != self.stage:
             raise ValueError("environment state stage mismatch")
@@ -543,6 +649,10 @@ class PIDTuningEnv(gym.Env[dict[str, np.ndarray], np.ndarray]):
         self._step_count = int(state["step_count"])
         self._total_step_count = int(state["total_step_count"])
         self._episode_count = int(state["episode_count"])
+        self.set_plant_sampling_probabilities(state["plant_sampling_probabilities"])
+        self._sampled_model_probability = float(state["sampled_model_probability"])
+        if not 0.0 < self._sampled_model_probability <= 1.0:
+            raise ValueError("invalid restored model sampling probability")
         self._np_random = np.random.default_rng()
         self._np_random.bit_generator.state = copy.deepcopy(
             state["np_random_state"]

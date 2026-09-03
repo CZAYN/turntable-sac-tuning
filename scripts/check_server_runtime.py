@@ -18,6 +18,11 @@ from elc_rl.sac_training import (  # noqa: E402
     build_training_input_manifest,
     load_formal_training_config,
 )
+from elc_rl.controller_parameters import load_physics_training_anchor  # noqa: E402
+from elc_rl.performance_targets import (  # noqa: E402
+    load_controller_performance_targets,
+)
+from elc_rl.sac_training import TRAINING_PROTOCOL_SCHEMA_VERSION  # noqa: E402
 from elc_rl.tuning_env import PIDTuningEnv  # noqa: E402
 
 
@@ -56,6 +61,33 @@ def main() -> int:
     manifest = build_training_input_manifest(root, config)
     checks["training_input_file_count"] = len(manifest["files"])
     checks["training_input_fingerprint"] = manifest["fingerprint"]
+    checks["training_protocol_schema_version"] = TRAINING_PROTOCOL_SCHEMA_VERSION
+    targets = load_controller_performance_targets(root)
+    checks["bandwidth_acceptance_ranges_hz"] = {
+        loop: [
+            round(
+                target.bandwidth_hz * (1.0 - target.bandwidth_tolerance_fraction),
+                12,
+            ),
+            round(
+                target.bandwidth_hz * (1.0 + target.bandwidth_tolerance_fraction),
+                12,
+            ),
+        ]
+        for loop, target in targets.loops.items()
+    }
+    checks["acceptance_tolerance_config"] = (
+        None
+        if targets.acceptance_path is None
+        else targets.acceptance_path.relative_to(root).as_posix()
+    )
+    anchor = load_physics_training_anchor(root)
+    checks["training_anchor_file_sha256"] = anchor["file_sha256"]
+    checks["training_anchor_parameter_sha256"] = anchor[
+        "parameter_vector_sha256"
+    ]
+    checks["training_anchor_parameter_count"] = len(anchor["parameters"])
+    checks["training_anchor_acceptance_status"] = anchor["acceptance"]["status"]
 
     usage = shutil.disk_usage(output_root)
     free_gb = usage.free / (1024**3)
@@ -99,6 +131,11 @@ def main() -> int:
         checks["observation_valid"]
         and checks["reset_safe"]
         and checks["output_write_probe"]
+        and checks["training_anchor_parameter_count"] == 11
+        and checks["training_anchor_acceptance_status"]
+        == "engineering_initialization_only"
+        and checks["acceptance_tolerance_config"]
+        == "config/controller_acceptance_tolerances.json"
         and checks.get("environment_step_valid", True)
     )
     print(json.dumps(checks, ensure_ascii=False, indent=2))

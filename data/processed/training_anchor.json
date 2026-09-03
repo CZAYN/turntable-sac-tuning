@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "backend": "physics",
+  "task_id": "cgs_turntable_001",
+  "purpose": "formal_training_initialization_only",
+  "parameter_order": [
+    "kppos",
+    "kipos",
+    "kdpos",
+    "kpspeed",
+    "kispeed",
+    "kdspeed",
+    "kgspeed",
+    "tauspeed",
+    "kpcurr",
+    "kicurr",
+    "kdcurr"
+  ],
+  "parameters": [
+    154.115916267888,
+    1174.68679817217,
+    0.0889363246041873,
+    15.150929215729018,
+    237.98573934657006,
+    0.0,
+    0.941984523123572,
+    0.000848877412352825,
+    18.592976023848415,
+    2291.0460232311084,
+    0.0029121653988542578
+  ],
+  "parameter_vector_encoding": "little_endian_float64_c_order",
+  "parameter_vector_sha256": "abead01fb0c990034b1447386958982e18c98e7254a5b9be7b3411edd306761f",
+  "provenance": {
+    "selection_kind": "non_training_training_model_only_feasibility_scan",
+    "selected_report": {
+      "path": "outputs/speed_loop_feasibility_fixed_dobc_pid_local_20260825_v2/fixed_dobc_speed_pid_scan_report.json",
+      "sha256": "7ab0602b45630e4bfbf2b4079700ddfdf1448ea93284e73f13fd3cb0a87b1510",
+      "included_in_server_package": false
+    },
+    "upstream_dobc_report": {
+      "path": "outputs/speed_loop_feasibility_reduced_dobc_20260825/reduced_dobc_speed_scan_report.json",
+      "sha256": "3f95de8edcf088d1a54f8e3114f6bf01cac765ac17fbfc488d5c2363c6b74251",
+      "included_in_server_package": false
+    },
+    "selection_models": {
+      "training": 40,
+      "validation": 0,
+      "sealed_test": 0
+    },
+    "selected_speed_frequency_summary": {
+      "target_pass_count": 28,
+      "model_count": 40,
+      "minimum_bandwidth_hz": 84.4418800547631,
+      "maximum_bandwidth_hz": 115.576191283837,
+      "maximum_constraint_violation": 0.5576191283736714
+    },
+    "full_three_loop_six_metric_audit_executed": false,
+    "note": "The report digests record provenance only. The ignored scan outputs are not runtime inputs and are intentionally excluded from the server package."
+  },
+  "acceptance": {
+    "status": "engineering_initialization_only",
+    "passed_all_three_loops_six_metrics": false,
+    "eligible_as_final_candidate": false,
+    "final_acceptance_contract": "sealed 24-model evaluation of all six metrics for current, speed and position loops"
+  },
+  "hardware_use_allowed": false
+}

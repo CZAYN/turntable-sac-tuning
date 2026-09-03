@@ -116,7 +116,10 @@ def main() -> int:
                     command.extend(["--device", str(arguments.device)])
                 if arguments.n_envs is not None:
                     command.extend(["--n-envs", str(arguments.n_envs)])
-                if arguments.resume:
+                resume_seed = arguments.resume and (run_dir / "trainer_state.json").is_file()
+                if arguments.resume and run_dir.exists() and any(run_dir.iterdir()) and not resume_seed:
+                    raise FileExistsError(f"cannot resume a nonempty seed directory without trainer_state.json: {run_dir}")
+                if resume_seed:
                     command.append("--resume")
                 if arguments.engineering_check_steps_per_stage is not None:
                     command.extend(
