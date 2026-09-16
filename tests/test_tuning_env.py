@@ -15,6 +15,7 @@ from elc_rl.tuning_env import (
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PURE_PHYSICS_RUNTIME_FILES = (
     "config/motor_physics.json",
+    "config/controller_acceptance_tolerances.json",
     "config/controller_performance_targets.json",
     "data/processed/controller_parameter_space.json",
     "data/processed/physics_motor_ensemble.npz",
@@ -120,6 +121,11 @@ def test_public_candidate_audit_uses_the_same_objective():
         "safe",
         "valid",
         "cost",
+        "target_pass",
+        "maximum_target_violation",
+        "target_violation_count",
+        "evaluated_splits",
+        "evaluated_loops",
         "frequency",
         "time_domain",
         "parameters",
@@ -218,7 +224,7 @@ def test_exported_environment_state_restores_exact_next_transition():
     first.reset(seed=314159)
     first.step(np.full(11, 0.05, dtype=np.float32))
     state = first.export_state()
-    assert state["schema_version"] == 4
+    assert state["schema_version"] == 6
     expected = first.step(np.full(11, -0.03, dtype=np.float32))
 
     restored = PIDTuningEnv(
@@ -252,6 +258,27 @@ def test_legacy_environment_state_is_rejected():
         "unsupported environment state schema",
     ):
         environment.restore_state(state)
+
+
+def test_weighted_training_model_draw_and_rng_restore():
+    environment = PIDTuningEnv(PROJECT_ROOT, stage="speed", initial_perturbation=0.0)
+    probabilities = np.full(40, 0.9 / 39, dtype=np.float64)
+    probabilities[0] = 0.1
+    environment.set_plant_sampling_probabilities(probabilities)
+    _, info = environment.reset(seed=314, options={"perturb": False})
+    state = environment.export_state()
+    expected_index = int(np.random.default_rng(314).choice(environment.evaluator.training_indices, p=probabilities))
+    assert info["sampled_model_ids"] == environment.evaluator.model_ids(np.asarray([expected_index]))
+    expected_observation, expected_info = environment.reset(options={"perturb": False})
+    environment.restore_state(state)
+    actual_observation, actual_info = environment.reset(options={"perturb": False})
+    assert actual_info["sampled_model_ids"] == expected_info["sampled_model_ids"]
+    assert actual_info["sampled_model_probability"] == expected_info["sampled_model_probability"]
+    for name in expected_observation:
+        assert np.array_equal(actual_observation[name], expected_observation[name])
+    with np.testing.assert_raises_regex(ValueError, "training models"):
+        environment.set_plant_sampling_probabilities(np.full(56, 1 / 56))
+    environment.close()
 
 
 def test_every_stage_can_reset_and_step():

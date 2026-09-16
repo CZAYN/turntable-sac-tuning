@@ -30,7 +30,7 @@ def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Run all declared formal SAC seeds with bounded concurrency."
+        description="Run all declared formal CrossQ seeds with bounded concurrency."
     )
     parser.add_argument("--project-root", type=Path, default=PROJECT_ROOT)
     parser.add_argument("--config", type=Path, default=None)
@@ -110,8 +110,7 @@ def main() -> int:
                     "--output-dir",
                     str(run_dir),
                 ]
-                if config.path != root / "config" / "sac_training.json":
-                    command.extend(["--config", str(config.path)])
+                command.extend(["--config", str(config.path)])
                 if arguments.device is not None:
                     command.extend(["--device", str(arguments.device)])
                 if arguments.n_envs is not None:

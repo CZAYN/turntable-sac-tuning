@@ -1,16 +1,18 @@
-"""Core utilities for the CGS turntable RL project."""
+"""CrossQ tuning for three-loop PIDF and parallel DOBC control."""
 
 __all__ = [
     "controller_parameters",
-    "data_processing",
+    "crossq",
+    "discrete_loop_model",
     "evaluation_utils",
-    "final_test_evaluator",
+    "frozen_policy",
+    "parallel_env",
     "performance_targets",
     "physics_evaluator",
     "physics_motor_model",
-    "physics_test_dataset",
+    "plant_sampling",
     "sac_training",
-    "task_dataset",
-    "transition_dataset",
+    "sampling_vec_env",
+    "simulation_kernel",
     "tuning_env",
 ]

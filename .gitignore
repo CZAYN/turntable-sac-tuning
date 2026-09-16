@@ -1,49 +1,42 @@
-# Python caches and build products
+# Python/build products
 __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
 .ruff_cache/
 build/
-
-# Local environments and credentials
+dist/
 .venv/
 venv/
 .env
 .env.*
-
-# Editor and agent-local state
 .vscode/
 .idea/
 .agents/
 .codex/
 .codex_tmp/
-
-# Generated runs, logs, and release archives
+# Local runs, weights, artifacts and documents
 outputs/
 runs/
 logs/
-dist/
 tmp/
+deliverables/
+deployment/
+artifacts/
+PPT/
 *.zip
-
-# Local notes and archived conversations
-WSL旧会话记录/
-电机三环控制与强化学习调参_完整会话.md
-
-# Keep the physics training inputs, measured FRF assets used only for offline
-# model-mismatch diagnostics, and the versioned candidate-independent test set.
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.docx
+*.pdf
+*.pptx
+# Only the required physics inputs are versioned
 data/*
 !data/processed/
 data/processed/*
 !data/processed/controller_parameter_space.json
 !data/processed/training_anchor.json
-!data/processed/frf_tasks.npz
-!data/processed/frf_tasks_manifest.json
 !data/processed/physics_motor_ensemble.npz
 !data/processed/physics_motor_ensemble_manifest.json
-!data/processed/physics_motor_six_metric_test_v2.npz
-!data/processed/physics_motor_six_metric_test_v2_manifest.json
-!data/processed/current_pidf_feasibility_40khz/
-!data/processed/current_pidf_feasibility_40khz/multirate_feasibility_report.json
-!data/processed/current_pidf_feasibility_40khz/continuous_worst_case_report.json

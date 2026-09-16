@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "backend": "physics",
-  "run_name": "sac_training",
-  "description": "Local four-stage SAC training for the 11-D three-loop PIDF tuner with DOBC integrated into the speed stage.",
+  "run_name": "crossq_training",
+  "description": "Four-stage CrossQ with stage-conditioned BRN and difficulty-aware plant sampling.",
   "default_device": "cuda",
   "seeds": [
     20260801,
@@ -27,17 +27,6 @@
       "total_timesteps": 120000
     }
   ],
-  "plant_sampling": {
-    "mode": "difficulty",
-    "uniform_fraction": 0.3,
-    "warmup_episodes_per_model": 2,
-    "ema_rate": 0.1,
-    "cost_clip": 100,
-    "margin_clip": 10,
-    "score_floor": 0.05,
-    "hardness_exponent": 1,
-    "maximum_probability": 0.1
-  },
   "environment": {
     "max_episode_steps": 32,
     "audit_interval": 64,
@@ -81,7 +70,7 @@
     "subdirectory": "tensorboard"
   },
   "runtime": {
-    "minimum_free_disk_gb": 10.0,
+    "minimum_free_disk_gb": 10,
     "progress_bar": false,
     "progress_interval_timesteps": 1000,
     "torch_deterministic_algorithms": false
@@ -91,5 +80,26 @@
     "validation_models": 16,
     "candidate_selection_source": "training_and_validation_only",
     "sealed_evaluation_available_during_training": false
+  },
+  "plant_sampling": {
+    "mode": "difficulty",
+    "uniform_fraction": 0.3,
+    "warmup_episodes_per_model": 2,
+    "ema_rate": 0.1,
+    "cost_clip": 100,
+    "margin_clip": 10,
+    "score_floor": 0.05,
+    "hardness_exponent": 1,
+    "maximum_probability": 0.1
+  },
+  "algorithm": "crossq",
+  "crossq": {
+    "normalization": "stage_brn",
+    "policy_delay": 3,
+    "brn": {
+      "momentum": 0.01,
+      "warmup_steps": 1000,
+      "min_batch_size": 8
+    }
   }
 }

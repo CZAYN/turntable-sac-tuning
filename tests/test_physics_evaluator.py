@@ -12,6 +12,7 @@ from elc_rl.physics_evaluator import (
     PHYSICS_FREQUENCY_POINTS,
     PHYSICS_FRICTION_CONTEXT_PARAMETER_NAMES,
     PhysicsControllerEvaluator,
+    _classical_phase_margin_deg,
     get_physics_controller_evaluator,
     get_physics_time_domain_evaluator,
 )
@@ -45,6 +46,15 @@ def _assert_no_legacy_public_keys(value):
             _assert_no_legacy_public_keys(child)
 
 
+def test_classical_phase_margin_is_invariant_to_unwrapped_full_turns():
+    expected = 77.105
+    assert np.isclose(_classical_phase_margin_deg(-102.895), expected)
+    assert np.isclose(_classical_phase_margin_deg(257.105), expected)
+    assert np.isclose(_classical_phase_margin_deg(617.105), expected)
+    assert _classical_phase_margin_deg(0.0) == 180.0
+    assert _classical_phase_margin_deg(180.0) == 0.0
+
+
 def test_physics_frequency_report_uses_only_the_three_frequency_table_metrics():
     evaluator = get_physics_controller_evaluator(PROJECT_ROOT)
     report = evaluator.audit(evaluator.space.initial)
@@ -62,12 +72,41 @@ def test_physics_frequency_report_uses_only_the_three_frequency_table_metrics():
             "gain_margin",
             "phase_margin",
         }
+        assert set(metrics["target_violations"]) == {
+            "bandwidth",
+            "gain_margin",
+            "phase_margin",
+        }
+        assert metrics["target_violation_model_count"] >= 0
         assert np.isfinite(metrics["frequency_cost"])
     assert "crossover" not in report["cost"]
     assert "sensitivity" not in report["cost"]
     assert "bandwidth_hierarchy" not in report["cost"]
     assert "dobc_idealized" not in report["cost"]
     _assert_no_legacy_public_keys(report)
+
+
+def test_position_phase_margin_uses_the_classical_branch():
+    evaluator = get_physics_controller_evaluator(PROJECT_ROOT)
+    report = evaluator._evaluate(
+        evaluator.space.initial,
+        evaluator.audit_indices,
+        frequency_points=PHYSICS_FREQUENCY_POINTS,
+        mode="test_position_phase_margin_branch",
+        include_models=True,
+        loops=("position",),
+    )
+    margins = np.asarray(
+        [
+            row["phase_margin_deg"]
+            for row in report["models"]
+            if row["loop"] == "position"
+        ],
+        dtype=np.float64,
+    )
+    assert margins.size == 56
+    assert np.all((-180.0 < margins) & (margins <= 180.0))
+    assert 70.0 < float(np.min(margins)) < float(np.max(margins)) < 90.0
 
 
 def test_physics_time_report_uses_only_the_three_time_table_metrics():
@@ -85,6 +124,12 @@ def test_physics_time_report_uses_only_the_three_time_table_metrics():
             "rise_time",
             "settling_time",
         }
+        assert set(metrics["target_violations"]) == {
+            "overshoot",
+            "rise_time",
+            "settling_time",
+        }
+        assert metrics["target_violation_model_count"] >= 0
         assert np.isfinite(metrics["time_cost"])
     _assert_no_legacy_public_keys(report)
 

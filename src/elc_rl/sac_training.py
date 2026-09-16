@@ -1,4 +1,4 @@
-"""Resumable formal SAC training for the physics tuning environment.
+"""Resumable four-stage CrossQ training for the physics tuning environment.
 
 This module intentionally depends on the production environment's public API.
 It does not import the small pipeline-check training entry point or consume any
@@ -24,6 +24,7 @@ import cloudpickle
 import gymnasium
 import numpy as np
 from stable_baselines3 import SAC
+from .crossq import StageCrossQ, StageBatchRenorm
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.vec_env import VecEnv
 import torch
@@ -53,12 +54,13 @@ TRAINING_INPUT_RELATIVE_PATHS = (
     "src/elc_rl/physics_motor_model.py",
     "src/elc_rl/simulation_kernel.py",
     "src/elc_rl/sac_training.py",
+    "src/elc_rl/crossq.py",
     "src/elc_rl/tuning_env.py",
     "scripts/train_sac.py",
 )
 
 PROGRESS_REPORT_INTERVAL_TIMESTEPS = 1000
-TRAINING_PROTOCOL_SCHEMA_VERSION = 6
+TRAINING_PROTOCOL_SCHEMA_VERSION = 7
 
 
 def utc_now() -> str:
@@ -137,11 +139,27 @@ def load_formal_training_config(
 ) -> FormalTrainingConfig:
     root = Path(project_root).resolve()
     path = (
-        root / "config" / "sac_training.json"
+        root / "config" / "crossq_training.json"
         if config_path is None
         else Path(config_path).resolve()
     )
     payload = json.loads(path.read_text(encoding="utf-8"))
+    algorithm = payload.get("algorithm", "sac")
+    if algorithm not in ("sac", "crossq"):
+        raise ValueError("algorithm must be sac or crossq")
+    if algorithm == "crossq":
+        crossq = payload.get("crossq", {})
+        if crossq.get("normalization") != "stage_brn":
+            raise ValueError("CrossQ requires stage_brn normalization")
+        if int(crossq.get("policy_delay", 0)) < 1:
+            raise ValueError("CrossQ policy_delay must be positive")
+        brn = crossq.get("brn", {})
+        if (not 0 < float(brn.get("momentum", 0)) <= 1
+                or int(brn.get("warmup_steps", -1)) < 0
+                or int(brn.get("min_batch_size", 0)) < 2):
+            raise ValueError("invalid CrossQ BRN configuration")
+    elif "crossq" in payload:
+        raise ValueError("SAC configuration cannot contain CrossQ settings")
     _required_keys(
         payload,
         (
@@ -577,11 +595,23 @@ class CandidateCollectorCallback(BaseCallback):
         pool: CandidatePool,
         stop_controller: StopController,
         progress_reporter: TrainingProgressReporter | None = None,
+        diagnostics_dir: Path | None = None,
     ) -> None:
         super().__init__(verbose=0)
         self.pool = pool
         self.stop_controller = stop_controller
         self.progress_reporter = progress_reporter
+        self.diagnostics_dir = diagnostics_dir
+        self.next_diagnostic = 0
+
+    def _on_rollout_end(self) -> None:
+        if self.diagnostics_dir is not None and self.model.num_timesteps >= self.next_diagnostic:
+            self.next_diagnostic = int(self.model.num_timesteps) + 1000
+            write_training_diagnostics(self.model, self.pool.stage, self.diagnostics_dir)
+
+    def _on_training_end(self) -> None:
+        if self.diagnostics_dir is not None:
+            write_training_diagnostics(self.model, self.pool.stage, self.diagnostics_dir)
 
     def _on_step(self) -> bool:
         infos = list(self.locals.get("infos", []))
@@ -607,6 +637,54 @@ class CandidateCollectorCallback(BaseCallback):
         if self.progress_reporter is not None:
             self.progress_reporter.report(int(self.model.num_timesteps))
         return not self.stop_controller.requested
+
+
+def write_training_diagnostics(model, stage: str, directory: Path) -> None:
+    """Read-only inference-mode replay probe; preserve RNG and BRN statistics."""
+    if model.replay_buffer is None or model.replay_buffer.size() == 0:
+        return
+    numpy_state = np.random.get_state()
+    actor_mode, critic_mode = model.actor.training, model.critic.training
+    devices = [model.device.index or 0] if model.device.type == "cuda" else []
+    try:
+        with torch.random.fork_rng(devices=devices), torch.no_grad():
+            model.actor.set_training_mode(False)
+            model.critic.set_training_mode(False)
+            replay = model.replay_buffer.sample(min(256, model.batch_size))
+            q = torch.cat(model.critic(replay.observations, replay.actions), dim=1)
+            next_actions, next_log_prob = model.actor.action_log_prob(replay.next_observations)
+            target_critic = model.critic if isinstance(model, StageCrossQ) else model.critic_target
+            q_next = torch.cat(target_critic(replay.next_observations, next_actions), dim=1).min(dim=1, keepdim=True).values
+            alpha = model.log_ent_coef.exp() if model.log_ent_coef is not None else model.ent_coef_tensor
+            discounts = replay.discounts if replay.discounts is not None else model.gamma
+            target = replay.rewards + (1 - replay.dones) * discounts * (q_next - alpha * next_log_prob.reshape(-1, 1))
+            ids = replay.observations["stage"].argmax(dim=1)
+            by_stage = {}
+            for index, name in enumerate(STAGE_ORDER):
+                chosen = ids == index
+                count = int(chosen.sum())
+                if count:
+                    by_stage[name] = {
+                        "sample_count": count,
+                        "q_mean": float(q[chosen].mean()),
+                        "q_abs_max": float(q[chosen].abs().max()),
+                        "td_error_abs": float((q[chosen] - target[chosen]).abs().mean()),
+                    }
+            report = {"stage": stage, "global_timesteps": int(model.num_timesteps),
+                      "n_updates": int(model._n_updates), "ent_coef": float(alpha),
+                      "probe_mode": "eval_statistics_no_updates", "replay_by_stage": by_stage}
+            report["brn_updates"] = {
+                name: layer.num_batches_tracked.cpu().tolist()
+                for name, layer in model.policy.named_modules()
+                if isinstance(layer, StageBatchRenorm)
+            }
+            if not all(np.isfinite(value) for row in by_stage.values() for value in row.values()):
+                raise FloatingPointError("non-finite replay diagnostics")
+            _atomic_write_json(directory / f"g{model.num_timesteps:09d}_{stage}.json", report)
+    finally:
+        np.random.set_state(numpy_state)
+        model.actor.set_training_mode(actor_mode)
+        model.critic.set_training_mode(critic_mode)
 
 
 def audit_parameters(
@@ -950,6 +1028,7 @@ def _save_resume_checkpoint(
             ),
             "environment_state_saved": model_environment is not None,
             "plant_sampler_state_saved": sampling_saved,
+            "algorithm": config.payload.get("algorithm", "sac"),
         }
         _atomic_write_json(temporary / "checkpoint.json", metadata)
         (temporary / "COMPLETE").write_text("complete\n", encoding="utf-8")
@@ -1081,7 +1160,13 @@ def _load_checkpoint(
         if not checkpoint_metadata.get("plant_sampler_state_saved") or not sampler_path.is_file():
             raise ValueError("checkpoint is missing the required plant sampler state")
         environment.restore_sampling_state(json.loads(sampler_path.read_text(encoding="utf-8")))
-    model = SAC.load(
+    algorithm = checkpoint_metadata.get("algorithm", "sac")
+    if algorithm not in ("sac", "crossq"):
+        raise ValueError("unknown checkpoint algorithm")
+    if algorithm != state.get("algorithm", "sac"):
+        raise ValueError("checkpoint algorithm does not match trainer state")
+    algorithm_class = StageCrossQ if algorithm == "crossq" else SAC
+    model = algorithm_class.load(
         checkpoint / "model.zip",
         env=environment,
         device=device,
@@ -1100,6 +1185,9 @@ def _load_checkpoint(
             "checkpoint timestep mismatch: "
             f"model={model.num_timesteps}, state={expected_steps}"
         )
+    for path in (run_dir / "training_diagnostics").glob("g*.json"):
+        if int(path.stem.split("_", 1)[0][1:]) > expected_steps:
+            path.unlink()
     return model
 
 
@@ -1111,24 +1199,30 @@ def _new_model(
     effective_sac: Mapping[str, Any],
 ) -> SAC:
     sac = effective_sac
-    return SAC(
+    algorithm_class = StageCrossQ if sac.get("algorithm", "sac") == "crossq" else SAC
+    extra = {}
+    policy_kwargs = {"net_arch": [int(value) for value in sac["network_architecture"]]}
+    if algorithm_class is StageCrossQ:
+        extra["policy_delay"] = int(sac["crossq"]["policy_delay"])
+        policy_kwargs["brn_kwargs"] = dict(sac["crossq"]["brn"])
+    else:
+        extra["tau"] = float(sac["tau"])
+    return algorithm_class(
         str(sac["policy"]),
         environment,
         learning_rate=float(sac["learning_rate"]),
         buffer_size=int(sac["buffer_size"]),
         learning_starts=int(sac["learning_starts"]),
         batch_size=int(sac["batch_size"]),
-        tau=float(sac["tau"]),
         gamma=float(sac["gamma"]),
         train_freq=(int(sac["train_frequency"]), "step"),
         gradient_steps=int(sac["gradient_steps"]),
-        policy_kwargs={
-            "net_arch": [int(value) for value in sac["network_architecture"]]
-        },
+        policy_kwargs=policy_kwargs,
         tensorboard_log=tensorboard_log,
         seed=seed,
         device=device,
         verbose=0,
+        **extra,
     )
 
 
@@ -1138,6 +1232,10 @@ def _effective_sac_parameters(
     n_envs: int,
 ) -> dict[str, Any]:
     parameters = dict(config.payload["sac"])
+    parameters["algorithm"] = config.payload.get("algorithm", "sac")
+    if parameters["algorithm"] == "crossq":
+        parameters["crossq"] = dict(config.payload["crossq"])
+        parameters.pop("tau", None)
     parameters["network_architecture"] = list(
         config.payload["sac"]["network_architecture"]
     )
@@ -1236,6 +1334,7 @@ def _initial_state(
         "schema_version": TRAINING_PROTOCOL_SCHEMA_VERSION,
         "backend": "physics",
         "status": "running",
+        "algorithm": config.payload.get("algorithm", "sac"),
         "run_kind": run_kind,
         "seed": int(seed),
         "config_sha256": config.sha256,
@@ -1278,6 +1377,7 @@ def _verify_resume_state(
             "training protocol"
         )
     expected = {
+        "algorithm": config.payload.get("algorithm", "sac"),
         "backend": "physics",
         "seed": int(seed),
         "config_sha256": config.sha256,
@@ -1616,6 +1716,7 @@ def run_formal_training(
                     pool,
                     controller,
                     progress_reporter,
+                    output / "training_diagnostics",
                 )
                 before = int(model.num_timesteps)
                 model.learn(

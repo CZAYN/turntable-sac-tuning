@@ -1,15 +1,17 @@
 import hashlib
 import json
 from pathlib import Path
+import shutil
 
 import numpy as np
 import pytest
 
 from elc_rl.controller_parameters import (
     PARAMETER_ORDER,
-    derive_physics_controller_initials,
+    PHYSICS_TRAINING_ANCHOR_RELATIVE_PATH,
     load_current_pidf_feasibility_evidence,
     load_physics_controller_parameter_space,
+    load_physics_training_anchor,
 )
 from elc_rl.performance_targets import load_controller_performance_targets
 from elc_rl.physics_motor_model import load_physics_motor_config
@@ -22,29 +24,70 @@ def _space():
     return load_physics_controller_parameter_space(PROJECT_ROOT)
 
 
-def test_physics_parameter_order_and_initials_use_the_real_target_table():
+def test_physics_parameter_order_and_initials_use_the_training_anchor():
     space = _space()
+    anchor = load_physics_training_anchor(PROJECT_ROOT)
     assert space.names == PARAMETER_ORDER
     assert space.metadata["profile"] == "physics"
-    expected = derive_physics_controller_initials(PROJECT_ROOT)
-    evidence = space.metadata.get("current_pidf_feasibility_evidence")
-    if evidence is not None:
-        for name, value in evidence["selected_current_parameters"].items():
-            expected[space.names.index(name)] = value
     assert np.allclose(
         space.initial,
-        expected,
+        anchor["parameters_array"],
         rtol=1e-12,
         atol=0.0,
     )
-    assert all(
-        spec.source_kind in {
-            "performance_target_seed_derived",
-            "non_training_feasibility_candidate_derived",
-            "approved_dobc_structure",
-        }
-        for spec in space.specs
+    assert all(spec.source_kind == "formal_training_anchor" for spec in space.specs)
+    assert space.metadata["training_anchor"]["file_sha256"] == anchor["file_sha256"]
+    assert not space.metadata["training_anchor"]["eligible_as_final_candidate"]
+
+
+def test_training_anchor_is_hash_locked_and_not_an_acceptance_result():
+    anchor = load_physics_training_anchor(PROJECT_ROOT)
+    assert anchor["parameter_vector_sha256"] == (
+        "abead01fb0c990034b1447386958982e18c98e7254a5b9be7b3411edd306761f"
     )
+    assert anchor["provenance"]["selection_models"] == {
+        "training": 40,
+        "validation": 0,
+        "sealed_test": 0,
+    }
+    assert anchor["acceptance"]["passed_all_three_loops_six_metrics"] is False
+    assert anchor["acceptance"]["eligible_as_final_candidate"] is False
+    assert anchor["hardware_use_allowed"] is False
+
+
+def test_parameter_space_falls_back_when_training_anchor_is_absent(tmp_path):
+    destination = tmp_path / "data" / "processed"
+    destination.mkdir(parents=True)
+    shutil.copyfile(
+        PROJECT_ROOT / "data" / "processed" / "controller_parameter_space.json",
+        destination / "controller_parameter_space.json",
+    )
+    raw = json.loads(
+        (destination / "controller_parameter_space.json").read_text(encoding="utf-8")
+    )
+    space = load_physics_controller_parameter_space(tmp_path)
+    expected = np.asarray(
+        [parameter["initial"] for parameter in raw["parameters"]],
+        dtype=np.float64,
+    )
+    assert np.array_equal(space.initial, expected)
+    assert "training_anchor" not in space.metadata
+
+
+def test_training_anchor_tampering_is_rejected(tmp_path):
+    destination = tmp_path / "data" / "processed"
+    destination.mkdir(parents=True)
+    for name in ("controller_parameter_space.json", "training_anchor.json"):
+        shutil.copyfile(
+            PROJECT_ROOT / "data" / "processed" / name,
+            destination / name,
+        )
+    anchor_path = tmp_path / PHYSICS_TRAINING_ANCHOR_RELATIVE_PATH
+    payload = json.loads(anchor_path.read_text(encoding="utf-8"))
+    payload["parameters"][3] += 1.0
+    anchor_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="SHA256"):
+        load_physics_controller_parameter_space(tmp_path)
 
 
 def test_parameter_metadata_links_the_model_and_six_metric_targets():

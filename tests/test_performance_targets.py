@@ -4,6 +4,7 @@ import numpy as np
 
 from elc_rl.performance_targets import (
     frequency_normalized_errors,
+    frequency_target_violations,
     load_controller_performance_targets,
     time_normalized_errors,
 )
@@ -30,6 +31,37 @@ def test_literal_controller_performance_target_table_is_loaded_with_units():
             target.maximum_settling_time_s,
         )
         assert actual == values
+    assert targets.loop("current").bandwidth_tolerance_fraction == 0.1
+    assert targets.loop("speed").bandwidth_tolerance_fraction == 0.2
+    assert targets.loop("position").bandwidth_tolerance_fraction == 0.1
+    assert targets.acceptance_path == (
+        PROJECT_ROOT / "config" / "controller_acceptance_tolerances.json"
+    )
+
+
+def test_speed_bandwidth_acceptance_is_exactly_80_to_120_hz():
+    targets = load_controller_performance_targets(PROJECT_ROOT)
+    target = targets.loop("speed")
+    common = {
+        "gain_margin_db": target.minimum_gain_margin_db,
+        "phase_margin_deg": target.minimum_phase_margin_deg,
+        "target": target,
+        "invalid_error": targets.cost.invalid_normalized_error,
+    }
+    assert frequency_target_violations(bandwidth_hz=80.0, **common) == {
+        "bandwidth": 0.0,
+        "gain_margin": 0.0,
+        "phase_margin": 0.0,
+    }
+    assert frequency_target_violations(bandwidth_hz=120.0, **common)[
+        "bandwidth"
+    ] == 0.0
+    assert frequency_target_violations(bandwidth_hz=79.0, **common)[
+        "bandwidth"
+    ] > 0.0
+    assert frequency_target_violations(bandwidth_hz=121.0, **common)[
+        "bandwidth"
+    ] > 0.0
 
 
 def test_six_metric_error_directions_match_target_and_limit_semantics():
