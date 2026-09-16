@@ -13,6 +13,7 @@ from elc_rl.sac_training import (
     StopController,
     TRAINING_PROTOCOL_SCHEMA_VERSION,
     TrainingProgressReporter,
+    _audit_improves,
     _effective_sac_parameters,
     _load_checkpoint,
     _reconcile_stage_progress,
@@ -52,6 +53,7 @@ def test_training_input_manifest_is_deterministic_and_training_only():
     assert "data/processed/physics_motor_ensemble.npz" in names
     assert "scripts/train_sac.py" in names
     assert "config/controller_performance_targets.json" in names
+    assert "config/controller_acceptance_tolerances.json" in names
     assert "src/elc_rl/performance_targets.py" in names
     assert not any("physics_motor_test" in name for name in names)
     assert not any("final_test" in name for name in names)
@@ -73,6 +75,58 @@ def test_candidate_pool_deduplicates_and_keeps_the_lowest_costs():
     assert len(pool.records) == 2
     assert [record.fast_cost for record in pool.records] == [0.5, 1.0]
     assert pool.records[0].global_timestep == 4
+
+
+def test_candidate_pool_prioritizes_six_metric_feasibility_before_cost():
+    pool = CandidatePool("joint", maximum_size=2)
+    failing = np.arange(11, dtype=np.float64)
+    passing = failing + 1.0
+    pool.add(
+        CandidateRecord(
+            "joint",
+            0.01,
+            failing,
+            1,
+            fast_target_pass=False,
+            fast_maximum_target_violation=0.02,
+            fast_target_violation_count=1,
+        )
+    )
+    pool.add(
+        CandidateRecord(
+            "joint",
+            10.0,
+            passing,
+            2,
+            fast_target_pass=True,
+            fast_maximum_target_violation=0.0,
+            fast_target_violation_count=0,
+        )
+    )
+    assert pool.records[0].fast_target_pass
+    assert pool.records[0].fast_cost == 10.0
+
+
+def test_stage_acceptance_prefers_feasibility_then_requires_cost_improvement():
+    baseline = {
+        "safe": True,
+        "target_pass": False,
+        "maximum_target_violation": 0.02,
+        "target_violation_count": 2,
+        "cost": 0.1,
+    }
+    passing = {
+        "safe": True,
+        "target_pass": True,
+        "maximum_target_violation": 0.0,
+        "target_violation_count": 0,
+        "cost": 10.0,
+    }
+    assert _audit_improves(passing, baseline, 1e-6)
+    slightly_cheaper_pass = {**passing, "cost": 9.9999995}
+    assert not _audit_improves(slightly_cheaper_pass, passing, 1e-6)
+    materially_cheaper_pass = {**passing, "cost": 9.0}
+    assert _audit_improves(materially_cheaper_pass, passing, 1e-6)
 
 
 class _FakeVecEnv:
@@ -304,6 +358,9 @@ def test_candidate_callback_assigns_distinct_vector_transition_timesteps():
                 "fast_safe": True,
                 "stage_cost": float(cost),
                 "parameters": np.full(11, cost, dtype=np.float64),
+                "stage_target_pass": cost == 1,
+                "stage_maximum_target_violation": max(0.0, cost - 1.0),
+                "stage_target_violation_count": int(cost != 1),
             }
             for cost in (1, 2, 3, 4)
         ]
@@ -311,6 +368,7 @@ def test_candidate_callback_assigns_distinct_vector_transition_timesteps():
     assert callback._on_step()
     by_cost = {record.fast_cost: record.global_timestep for record in pool.records}
     assert by_cost == {1.0: 101, 2.0: 102, 3.0: 103, 4.0: 104}
+    assert pool.records[0].fast_target_pass
 
 
 def test_failed_checkpoint_progress_is_reconciled_from_model_timesteps():

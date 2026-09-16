@@ -4,20 +4,26 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "elc-rl"
-version = "0.1.0"
-description = "Reproducible data and model utilities for the CGS turntable RL project"
+version = "1.0.0"
+description = "CrossQ with stage-conditioned BRN and difficulty sampling for three-loop servo tuning"
 requires-python = ">=3.11"
-
-[project.optional-dependencies]
-training = [
+dependencies = [
+    "cloudpickle>=3,<4",
     "control>=0.10,<0.11",
     "gymnasium>=1.2,<1.4",
     "numba>=0.66,<0.67",
     "numpy>=2.0,<3",
     "scipy>=1.14,<2",
     "stable-baselines3>=2.9,<3",
-    "tensorboard>=2.18,<3",
+    "torch>=2.5,<3",
 ]
+
+[project.optional-dependencies]
+training = ["tensorboard>=2.18,<3"]
+test = ["pytest>=8,<10"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

@@ -7,8 +7,8 @@ import numpy as np
 import pytest
 
 from elc_rl.controller_parameters import (
-    derive_physics_controller_initials,
     load_physics_controller_parameter_space,
+    load_physics_training_anchor,
 )
 from elc_rl.physics_motor_model import (
     MODEL_PARAMETER_NAMES,
@@ -312,15 +312,14 @@ def test_physics_ensemble_is_coherent_and_inside_declared_uncertainty(tmp_path):
     assert np.all(ensemble["parameters"][:, ~nonzero] == 0.0)
 
 
-def test_all_11_physics_initials_are_active_and_match_design():
+def test_all_11_physics_initials_are_within_bounds_and_match_training_anchor():
     space = load_physics_controller_parameter_space(PROJECT_ROOT)
-    expected = derive_physics_controller_initials(PROJECT_ROOT)
-    evidence = space.metadata.get("current_pidf_feasibility_evidence")
-    if evidence is not None:
-        for name, value in evidence["selected_current_parameters"].items():
-            expected[space.names.index(name)] = value
+    expected = load_physics_training_anchor(PROJECT_ROOT)["parameters_array"]
     assert np.allclose(space.initial, expected, rtol=1e-12, atol=0.0)
-    assert np.all(space.initial > 0.0)
+    # A zero speed derivative gain is a valid point in the declared space.
+    assert np.all(space.initial >= space.lower)
+    assert np.all(space.initial <= space.upper)
+    assert space.initial[6] > 0.0 and space.initial[7] > 0.0
     expected_period_s = {
         "current": 25e-6,
         "speed": 200e-6,
@@ -348,14 +347,17 @@ def test_nominal_discrete_scenarios_respect_simulation_envelope():
 
 def test_approved_dobc_sign_reduces_resisting_load_disturbance():
     config = load_physics_motor_config(PROJECT_ROOT)
-    space = load_physics_controller_parameter_space(PROJECT_ROOT)
-    disabled = space.initial.copy()
+    # Keep the approved structural regression independent of optional changes
+    # to the formal-training anchor. Do not weaken its reduction threshold.
+    payload = json.loads((PROJECT_ROOT / "data/processed/controller_parameter_space.json").read_text(encoding="utf-8"))
+    reference = np.asarray([item["initial"] for item in payload["parameters"]], dtype=np.float64)
+    disabled = reference.copy()
     disabled[6] = 0.0
     without_dobc = simulate_scenario(
         config, config.nominal, disabled, "disturbance"
     )
     with_dobc = simulate_scenario(
-        config, config.nominal, space.initial, "disturbance"
+        config, config.nominal, reference, "disturbance"
     )
     start = int(
         config.scenarios["disturbance_start_s"] / config.base_sample_period_s

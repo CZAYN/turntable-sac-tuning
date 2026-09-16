@@ -39,7 +39,7 @@ def _install_signal_handlers(controller: StopController) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Run or resume one independent seed of formal physics SAC training."
+            "Run or resume one independent seed of formal physics CrossQ training."
         )
     )
     parser.add_argument("--project-root", type=Path, default=PROJECT_ROOT)

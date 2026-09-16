@@ -9,6 +9,7 @@ import tempfile
 
 import numpy as np
 import torch
+from stable_baselines3.common.vec_env import DummyVecEnv
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -17,6 +18,8 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from elc_rl.sac_training import (  # noqa: E402
     build_training_input_manifest,
     load_formal_training_config,
+    _new_model,
+    _effective_sac_parameters,
 )
 from elc_rl.controller_parameters import load_physics_training_anchor  # noqa: E402
 from elc_rl.performance_targets import (  # noqa: E402
@@ -28,7 +31,7 @@ from elc_rl.tuning_env import PIDTuningEnv  # noqa: E402
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Validate a Python runtime before launching formal SAC training."
+        description="Validate a Python runtime before launching formal CrossQ training."
     )
     parser.add_argument("--project-root", type=Path, default=PROJECT_ROOT)
     parser.add_argument("--config", type=Path, default=None)
@@ -125,7 +128,15 @@ def main() -> int:
             environment.observation_space.contains(transition[0])
             and np.isfinite(transition[1])
         )
-    environment.close()
+    vector = DummyVecEnv([lambda: environment])
+    model = _new_model(vector, config.seeds[0], str(device), None,
+                       _effective_sac_parameters(config, "engineering_check", 1))
+    action, _ = model.predict(observation, deterministic=True)
+    checks["algorithm"] = config.payload.get("algorithm", "sac")
+    checks["policy_action_valid"] = bool(action.shape == (11,) and np.isfinite(action).all())
+    checks["has_target_critic"] = hasattr(model, "critic_target")
+    checks["algorithm_structure_valid"] = checks["has_target_critic"] == (checks["algorithm"] == "sac")
+    vector.close()
 
     checks["passed"] = bool(
         checks["observation_valid"]
@@ -137,6 +148,8 @@ def main() -> int:
         and checks["acceptance_tolerance_config"]
         == "config/controller_acceptance_tolerances.json"
         and checks.get("environment_step_valid", True)
+        and checks["policy_action_valid"]
+        and checks["algorithm_structure_valid"]
     )
     print(json.dumps(checks, ensure_ascii=False, indent=2))
     return 0 if checks["passed"] else 1
